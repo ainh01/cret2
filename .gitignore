@@ -1,28 +1,26 @@
+# Secrets / runtime config (API key lives here — never commit)
 .env
 .env.*
 .env.settings.tmp
+configure.tmp.json
+
+# Python
 __pycache__/
-.pytest_cache/
+*.pyc
+.venv/
+venv/
+
+# Node
 node_modules/
+
+# Runtime artifacts
+mock.pid
 test-results/
 
-# Virtual environments
-.venv/
-.venv*/
-venv/
-env/
-
-# QuickJS build artifacts
-qs_build/
-qs_wheel/
-
-# IDE
+# IDE / OS
 .vscode/
 .idea/
 *.swp
 *.swo
-*~
-
-# OS
 .DS_Store
 Thumbs.db

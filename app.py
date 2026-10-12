@@ -1,179 +1,115 @@
+import asyncio
+import copy
 import json
 import os
-import tempfile
-from urllib.parse import urlsplit
+import random
+import re
+import sys
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-import asyncio
-import uuid
-from datetime import datetime, timedelta
+from urllib.parse import urlsplit
 
 import httpx
 from dotenv import load_dotenv, set_key
-from fastapi import FastAPI, HTTPException, UploadFile
-from starlette.concurrency import run_in_threadpool
-from markitdown import MarkItDown
-from fastapi.responses import FileResponse, StreamingResponse, Response
-from fastapi.staticfiles import StaticFiles
+from fastapi import FastAPI, HTTPException
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
+
+from default_config import DEFAULT_CONFIG
 
 ROOT = Path(__file__).parent
 load_dotenv(ROOT / '.env')
 
+CONFIG_PATH = ROOT / 'configure.json'
+EFFORTS = {'off': 'Off', 'low': 'Low', 'medium': 'Medium', 'high': 'High'}
+OPTION_VALUES = ['A', 'B', 'C', 'D']
+
+
+def normalize_endpoint(endpoint):
+    endpoint = (endpoint or '').strip().rstrip('/')
+    if endpoint and not endpoint.endswith('/chat/completions'):
+        endpoint += '/chat/completions'
+    return endpoint
+
+
 class GlobalSettings:
     def __init__(self):
-        self.endpoint = os.getenv('ENDPOINT', '').rstrip('/')
-        if self.endpoint and not self.endpoint.endswith('/chat/completions'):
-            self.endpoint += '/chat/completions'
+        self.endpoint = normalize_endpoint(os.getenv('ENDPOINT', ''))
         self.token = os.getenv('TOKEN', '')
-        self.use_proxy = os.getenv('USE_PROXY', 'true').strip().lower() not in ('false', '0', 'no', 'off')
-        self.stream = os.getenv('STREAM', 'true').strip().lower() not in ('false', '0', 'no', 'off')
-        self.hide_output = os.getenv('HIDE_OUTPUT', 'false').strip().lower() in ('true', '1', 'yes', 'on')
-    
-    def update(self, endpoint=None, token=None, stream=None, hide_output=None, use_proxy=None):
-        if use_proxy is not None:
-            self.use_proxy = use_proxy
+        self.model = os.getenv('MODEL', '')
+        self.thinking_effort = EFFORTS.get(os.getenv('THINKING_EFFORT', 'off').strip().lower(), 'Off')
+
+    def update(self, endpoint=None, token=None, model=None, thinking_effort=None):
         if endpoint is not None:
             self.endpoint = endpoint
         if token is not None:
             self.token = token
-        if stream is not None:
-            self.stream = stream
-        if hide_output is not None:
-            self.hide_output = hide_output
+        if model is not None:
+            self.model = model
+        if thinking_effort is not None:
+            self.thinking_effort = thinking_effort
+
 
 settings = GlobalSettings()
-PROXY = os.getenv('PROXY', 'http://127.0.0.1:3128').strip() or None
+PROXY = os.getenv('PROXY', '').strip() or None
 
 
 @asynccontextmanager
 async def lifespan(app):
     limits = httpx.Limits(max_connections=100, max_keepalive_connections=50)
-    app.state.client = httpx.AsyncClient(
-        proxy=PROXY, trust_env=False,
-        timeout=httpx.Timeout(1800, connect=30, pool=None),
-        limits=limits,
-    )
-    app.state.direct_client = httpx.AsyncClient(
-        trust_env=False,
-        timeout=httpx.Timeout(1800, connect=30, pool=None),
-        limits=limits,
-    )
-    app.state.chat_cache = {}
-    app.state.chat_queue = asyncio.Queue()
-    workers = [asyncio.create_task(chat_worker()) for _ in range(3)]
-
-    async def cache_janitor():
-        while True:
-            await asyncio.sleep(60)
-            purge_expired_cache()
-
-    janitor = asyncio.create_task(cache_janitor())
+    timeout = httpx.Timeout(1800, connect=30, pool=None)
+    app.state.client = httpx.AsyncClient(proxy=PROXY, trust_env=False, timeout=timeout, limits=limits)
+    app.state.direct_client = httpx.AsyncClient(trust_env=False, timeout=timeout, limits=limits)
     try:
         yield
     finally:
-        janitor.cancel()
-        for worker in workers:
-            worker.cancel()
-        for cache_id in list(app.state.chat_cache):
-            drop_cache_entry(cache_id)
         await app.state.client.aclose()
         await app.state.direct_client.aclose()
 
 
 def api_client():
-    return app.state.client if settings.use_proxy else app.state.direct_client
+    return app.state.client if PROXY else app.state.direct_client
 
 
-app = FastAPI(title='VTask Cret', lifespan=lifespan)
-app.mount('/static', StaticFiles(directory=ROOT / 'static'), name='static')
+app = FastAPI(title='Cret2', lifespan=lifespan)
 
 
-def convert_upload(path):
-    return MarkItDown(enable_plugins=False).convert(path).text_content
-
-
-@app.post('/api/convert')
-async def convert_file(file: UploadFile):
-    # Use a generated temporary path, never a user-supplied path.
-    suffix = Path(file.filename or '').suffix.lower()
-    if len(suffix) > 20 or any(c not in '.abcdefghijklmnopqrstuvwxyz0123456789' for c in suffix):
-        suffix = ''
-    try:
-        with tempfile.TemporaryDirectory(prefix='vtask-upload-') as directory:
-            path = Path(directory) / ('input' + suffix)
-            size = 0
-            with path.open('wb') as target:
-                while chunk := await file.read(1024 * 1024):
-                    size += len(chunk)
-                    if size > 25 * 1024 * 1024:
-                        raise HTTPException(413, 'Files must be 25 MB or smaller.')
-                    target.write(chunk)
-            if not size:
-                raise HTTPException(400, 'The file is empty.')
-            try:
-                text = await run_in_threadpool(convert_upload, str(path))
-            except Exception:
-                raise HTTPException(422, 'Could not extract text from this file. It may be unsupported, damaged, or require additional conversion tools.')
-            if not text or not text.strip():
-                raise HTTPException(422, 'No text was extracted. Try a document containing selectable text.')
-            if len(text) > 1000000:
-                raise HTTPException(413, 'Extracted text exceeds the 1,000,000 character input limit.')
-            return {'text': text}
-    finally:
-        await file.close()
-
+# ---------------------------------------------------------------- pages
 
 @app.get('/')
-async def index():
-    return FileResponse(ROOT / 'static' / 'index.html')
+async def home():
+    return FileResponse(ROOT / 'static' / 'home.html')
 
 
-@app.get('/api/config')
-async def config():
-    models = []
-    warning = ''
-    if settings.endpoint and settings.token:
-        try:
-            result = await api_client().get(settings.endpoint.removesuffix('/chat/completions') + '/models', headers={'Authorization': f"Bearer {settings.token}"})
-            result.raise_for_status()
-            models = sorted(item['id'] for item in result.json().get('data', []) if item.get('id'))
-        except (httpx.HTTPError, ValueError, KeyError):
-            warning = 'Model discovery unavailable. Enter your model ID below.'
-    else:
-        warning = 'Set TOKEN and ENDPOINT in .env, then restart the server.'
-    return {'models': models, 'model': os.getenv('MODEL', 'inception/mercury-2.5'), 'route': 'Proxy' if settings.use_proxy and PROXY else 'Direct', 'warning': warning}
+@app.get('/settings')
+async def settings_page():
+    return FileResponse(ROOT / 'static' / 'settings.html')
 
 
-@app.get('/automode')
-async def automode():
-    return FileResponse(ROOT / 'static' / 'automode.html')
+@app.get('/configure')
+async def configure_page():
+    return FileResponse(ROOT / 'static' / 'configure.html')
 
 
-@app.get('/api/flows/vtask-maker')
-async def vtask_maker():
-    path = ROOT / 'vtask-automation.json'
-    if not path.is_file():
-        raise HTTPException(404, 'Vtask Maker flow file was not found.')
-    return FileResponse(path, media_type='application/json', headers={'Cache-Control': 'no-store'})
-
-
-@app.get('/setting')
-async def setting():
-    return FileResponse(ROOT / 'static' / 'setting.html')
-
+# ---------------------------------------------------------------- settings (.env)
 
 @app.get('/api/settings')
 async def get_settings():
-    return {'endpoint': settings.endpoint, 'has_key': bool(settings.token), 'stream': settings.stream, 'hide_output': settings.hide_output, 'use_proxy': settings.use_proxy}
+    return {
+        'endpoint': settings.endpoint,
+        'model': settings.model,
+        'thinking_effort': settings.thinking_effort,
+        'key_set': bool(settings.token),
+    }
 
 
 class SettingsRequest(BaseModel):
     endpoint: str = Field(min_length=1, max_length=2000)
     api_key: str = Field(default='', max_length=10000)
-    stream: bool | None = None
-    hide_output: bool | None = None
-    use_proxy: bool | None = None
+    model: str = Field(default='', max_length=300)
+    thinking_effort: str = Field(default='Off', max_length=20)
 
 
 @app.post('/api/settings')
@@ -186,15 +122,15 @@ async def save_settings(body: SettingsRequest):
     except ValueError:
         valid = False
     if not valid or any(char.isspace() for char in endpoint):
-        raise HTTPException(400, 'Enter an HTTP(S) endpoint without credentials, query parameters, or fragments.')
-    if not endpoint.endswith('/chat/completions'):
-        endpoint += '/chat/completions'
+        raise HTTPException(400, 'Hãy nhập endpoint HTTP(S) không chứa thông tin đăng nhập, tham số truy vấn hoặc fragment.')
+    endpoint = normalize_endpoint(endpoint)
     token = body.api_key.strip() or settings.token
-    if not token or any(ord(char) < 33 or ord(char) > 126 for char in token):
-        raise HTTPException(400, 'Enter a valid API key without whitespace.')
-    stream = settings.stream if body.stream is None else body.stream
-    hide_output = settings.hide_output if body.hide_output is None else body.hide_output
-    use_proxy = settings.use_proxy if body.use_proxy is None else body.use_proxy
+    if token and any(ord(char) < 33 or ord(char) > 126 for char in token):
+        raise HTTPException(400, 'Hãy nhập khóa API hợp lệ, không chứa khoảng trắng.')
+    model = body.model.strip()
+    effort = EFFORTS.get(body.thinking_effort.strip().lower())
+    if effort is None:
+        raise HTTPException(400, 'Mức suy luận phải là Tắt, Thấp, Trung bình hoặc Cao.')
     # Stage updates together, preserving the other environment settings.
     target = ROOT / '.env'
     staged = ROOT / '.env.settings.tmp'
@@ -202,270 +138,461 @@ async def save_settings(body: SettingsRequest):
         staged.write_text(target.read_text(encoding='utf-8') if target.exists() else '', encoding='utf-8')
         set_key(str(staged), 'ENDPOINT', endpoint)
         set_key(str(staged), 'TOKEN', token)
-        set_key(str(staged), 'STREAM', str(stream).lower())
-        set_key(str(staged), 'HIDE_OUTPUT', str(hide_output).lower())
-        set_key(str(staged), 'USE_PROXY', str(use_proxy).lower())
+        set_key(str(staged), 'MODEL', model)
+        set_key(str(staged), 'THINKING_EFFORT', effort)
         os.replace(staged, target)
     except OSError:
-        raise HTTPException(500, 'Could not save settings. Check environment file permissions.')
+        raise HTTPException(500, 'Không lưu được cài đặt. Kiểm tra quyền ghi file môi trường.')
     finally:
         staged.unlink(missing_ok=True)
-    settings.update(endpoint=endpoint, token=token, stream=stream, hide_output=hide_output, use_proxy=use_proxy)
-    return {**await get_settings(), 'message': 'Saved. New requests in both modes use these settings.'}
+    settings.update(endpoint=endpoint, token=token, model=model, thinking_effort=effort)
+    return {'status': 'saved'}
 
 
-@app.get('/quiz-parser.js')
-async def quiz_parser():
-    source = (ROOT / 'quiz.html').read_text(encoding='utf-8')
-    functions = source.split('    function processInput(', 1)[1].split('</script>', 1)[0]
-    script = ('const START_MARKER="```quiz", END_MARKER="endquiz```", OPTION_VALUES=["A","B","C","D"];\n'
-              + 'function processInput(' + functions)
-    return Response(script, media_type='application/javascript')
+# ---------------------------------------------------------------- configure (configure.json)
+
+def load_config():
+    cfg = copy.deepcopy(DEFAULT_CONFIG)
+    if CONFIG_PATH.exists():
+        try:
+            data = json.loads(CONFIG_PATH.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            data = {}
+        for key in ('quiz_frontend_base', 'quiz_backend_base', 'randomize'):
+            if key in data:
+                cfg[key] = data[key]
+        steps = data.get('steps') if isinstance(data.get('steps'), dict) else {}
+        for name in ('material', 'quiz', 'interactive'):
+            step = steps.get(name)
+            if isinstance(step, dict):
+                if 'enabled' in step:
+                    cfg['steps'][name]['enabled'] = bool(step['enabled'])
+                if 'template' in step:
+                    cfg['steps'][name]['template'] = str(step['template'])
+    return cfg
 
 
-def drop_cache_entry(cache_id):
-    app.state.chat_cache.pop(cache_id, None)
+@app.get('/api/configure')
+async def get_configure():
+    return load_config()
 
 
-def purge_expired_cache():
-    now = datetime.now()
-    for cache_id in [cid for cid, entry in app.state.chat_cache.items() if now > entry['expires_at']]:
-        drop_cache_entry(cache_id)
+class StepConfig(BaseModel):
+    enabled: bool = True
+    template: str = Field(default='', max_length=200000)
 
 
-class ChatRequest(BaseModel):
-    prompt: str | None = Field(default=None, max_length=1000000)
-    model: str | None = Field(default=None, max_length=300)
-    previous: str | None = Field(default=None, max_length=4000000)
-    followup: str | None = Field(default=None, max_length=1000000)
-    cache_id: str | None = Field(default=None, max_length=100)
+class ConfigureRequest(BaseModel):
+    quiz_frontend_base: str = Field(min_length=1, max_length=2000)
+    quiz_backend_base: str = Field(min_length=1, max_length=2000)
+    randomize: bool = True
+    material: StepConfig
+    quiz: StepConfig
+    interactive: StepConfig
 
 
-class PrepareRequest(BaseModel):
-    prompt: str = Field(min_length=1, max_length=1000000)
-    model: str = Field(min_length=1, max_length=300)
-    previous: str | None = Field(default=None, max_length=4000000)
-    followup: str | None = Field(default=None, max_length=1000000)
-
-
-@app.post('/api/prepare-chat')
-async def prepare_chat(body: PrepareRequest):
-    if not settings.endpoint or not settings.token:
-        raise HTTPException(503, 'TOKEN and ENDPOINT are required.')
-    
-    cache_id = str(uuid.uuid4())
-    messages = [{'role': 'user', 'content': body.prompt}]
-    if body.followup:
-        if not body.previous:
-            raise HTTPException(400, 'A completed response is required before following up.')
-        messages += [{'role': 'assistant', 'content': body.previous}, {'role': 'user', 'content': body.followup}]
-    
-    cache_entry = {
-        'chunks': [],
-        'completed': False,
-        'error': None,
-        'expires_at': datetime.now() + timedelta(hours=1),
-        'messages': messages,
-        'model': body.model,
+@app.post('/api/configure')
+async def save_configure(body: ConfigureRequest):
+    urls = {
+        'ứng dụng học': body.quiz_frontend_base.strip().rstrip('/'),
+        'kho lưu trữ': body.quiz_backend_base.strip().rstrip('/'),
     }
-    app.state.chat_cache[cache_id] = cache_entry
-    
-    app.state.chat_queue.put_nowait(cache_id)
-    
-    return {'cache_id': cache_id}
-
-
-async def chat_worker():
-    # Middleware worker: pulls prepared jobs off the queue and talks to the AI company.
-    while True:
-        cache_id = await app.state.chat_queue.get()
-        cache_entry = app.state.chat_cache.get(cache_id)
-        if cache_entry is not None and not cache_entry['completed']:
-            await stream_to_cache(cache_id, cache_entry['model'], cache_entry['messages'])
-        app.state.chat_queue.task_done()
-
-
-async def stream_to_cache(cache_id: str, model: str, messages: list):
-    import sys
-    print(f"[stream_to_cache] Starting for cache_id={cache_id}", file=sys.stderr)
-    cache_entry = app.state.chat_cache.get(cache_id)
-    if not cache_entry:
-        print(f"[stream_to_cache] Cache entry not found for {cache_id}", file=sys.stderr)
-        return
-    
-    endpoint, token = settings.endpoint, settings.token
-    print(f"[stream_to_cache] endpoint={endpoint}, model={model}", file=sys.stderr)
-    
+    for label, url in urls.items():
+        try:
+            parts = urlsplit(url)
+            valid = parts.scheme in ('http', 'https') and parts.hostname and not parts.query and not parts.fragment
+        except ValueError:
+            valid = False
+        if not valid:
+            raise HTTPException(400, f'Hãy nhập URL HTTP(S) hợp lệ cho {label}.')
+    cfg = {
+        'quiz_frontend_base': urls['ứng dụng học'],
+        'quiz_backend_base': urls['kho lưu trữ'],
+        'randomize': bool(body.randomize),
+        'steps': {
+            'material': {'enabled': bool(body.material.enabled), 'template': body.material.template},
+            'quiz': {'enabled': bool(body.quiz.enabled), 'template': body.quiz.template},
+            'interactive': {'enabled': bool(body.interactive.enabled), 'template': body.interactive.template},
+        },
+    }
+    staged = ROOT / 'configure.tmp.json'
     try:
-        print(f"[stream_to_cache] About to make API call", file=sys.stderr)
-        async with api_client().stream('POST', endpoint, headers={'Authorization': f'Bearer {token}'}, json={
-            'model': model, 'messages': messages, 'stream': True,
-        }) as response:
-            print(f"[stream_to_cache] Got response status={response.status_code}", file=sys.stderr)
+        staged.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+        os.replace(staged, CONFIG_PATH)
+    except OSError:
+        raise HTTPException(500, 'Không lưu được configure.json. Kiểm tra quyền ghi file.')
+    finally:
+        staged.unlink(missing_ok=True)
+    return {'status': 'saved'}
+
+
+# ---------------------------------------------------------------- AI call
+
+class PipelineError(Exception):
+    pass
+
+
+async def ai_call(user_message):
+    endpoint, token, model = settings.endpoint, settings.token, settings.model
+    if not endpoint or not model:
+        raise PipelineError('Chưa cấu hình AI. Mở trang /settings để đặt đường dẫn và tên mô hình.')
+    body = {'model': model, 'messages': [{'role': 'user', 'content': user_message}], 'stream': True}
+    effort = (settings.thinking_effort or 'Off').strip().lower()
+    if effort and effort != 'off':
+        body['reasoning_effort'] = effort
+    headers = {'Authorization': f'Bearer {token}'} if token else {}
+    chunks = []
+    try:
+        async with api_client().stream('POST', endpoint, headers=headers, json=body) as response:
             if response.is_error:
                 await response.aread()
-                cache_entry['error'] = f'API returned HTTP {response.status_code}'
-                cache_entry['completed'] = True
-                return
-            
+                raise PipelineError(f'AI trả về HTTP {response.status_code}: {response.text.strip()[:300]}')
             if 'application/json' in response.headers.get('content-type', ''):
-                print(f"[stream_to_cache] Non-streaming response", file=sys.stderr)
+                # Provider answered non-streaming anyway.
                 data = json.loads(await response.aread())
-                text = data['choices'][0]['message'].get('content') or ''
-                cache_entry['chunks'].append(text)
-                cache_entry['completed'] = True
-                print(f"[stream_to_cache] Completed with {len(text)} chars", file=sys.stderr)
-                return
-            
-            print(f"[stream_to_cache] Starting to read stream", file=sys.stderr)
-            chunk_count = 0
+                content = data['choices'][0]['message'].get('content') or ''
+                if isinstance(content, list):
+                    content = ''.join(part.get('text', '') for part in content if isinstance(part, dict))
+                return content
             async for line in response.aiter_lines():
                 if not line.startswith('data:'):
                     continue
                 payload = line[5:].strip()
                 if payload == '[DONE]':
-                    cache_entry['completed'] = True
-                    print(f"[stream_to_cache] Got [DONE], chunks={chunk_count}", file=sys.stderr)
                     break
-                data = json.loads(payload)
+                try:
+                    data = json.loads(payload)
+                except ValueError:
+                    continue
                 if data.get('error'):
-                    cache_entry['error'] = 'Provider error'
-                    cache_entry['completed'] = True
-                    print(f"[stream_to_cache] Provider error", file=sys.stderr)
-                    return
+                    raise PipelineError('Nhà cung cấp báo lỗi khi sinh nội dung. Vui lòng thử lại.')
                 for choice in data.get('choices', []):
                     text = choice.get('delta', {}).get('content')
                     if text:
-                        cache_entry['chunks'].append(text)
-                        chunk_count += 1
-                    if choice.get('finish_reason'):
-                        cache_entry['completed'] = True
-                        print(f"[stream_to_cache] Got finish_reason, chunks={chunk_count}", file=sys.stderr)
-            
-            # Ensure completed is set even if stream ends without [DONE]
-            cache_entry['completed'] = True
-            print(f"[stream_to_cache] Stream ended, total chunks={chunk_count}", file=sys.stderr)
-    except httpx.HTTPError as e:
-        print(f"[stream_to_cache] HTTPError: {e}", file=sys.stderr)
-        cache_entry['error'] = 'Connection failed'
-        cache_entry['completed'] = True
-    except (ValueError, KeyError, TypeError) as e:
-        print(f"[stream_to_cache] Parse error: {e}", file=sys.stderr)
-        cache_entry['error'] = 'Unexpected response format'
-        cache_entry['completed'] = True
-    except Exception as e:
-        import sys, traceback
-        print(f"stream_to_cache error: {e}", file=sys.stderr)
-        traceback.print_exc()
-        cache_entry['error'] = 'Generation failed unexpectedly.'
-        cache_entry['completed'] = True
+                        chunks.append(text)
+    except httpx.HTTPError as exc:
+        raise PipelineError(f'Không kết nối được tới endpoint AI ({endpoint}): {exc.__class__.__name__}: {exc}') from exc
+    except (ValueError, KeyError, IndexError, TypeError) as exc:
+        raise PipelineError('Endpoint AI trả về định dạng không hợp lệ.') from exc
+    content = ''.join(chunks)
+    if not content.strip():
+        raise PipelineError('Mô hình trả về phản hồi rỗng.')
+    return content
 
 
-@app.post('/api/chat')
-async def chat(body: ChatRequest):
-    cache_entry = None
-    if body.cache_id:
-        cache_entry = app.state.chat_cache.get(body.cache_id)
-        if cache_entry and datetime.now() > cache_entry['expires_at']:
-            drop_cache_entry(body.cache_id)
-            cache_entry = None
-        if cache_entry is None and not (body.prompt and body.model):
-            raise HTTPException(404, 'The prepared response is no longer available. Re-run this step.')
-    endpoint, token, to_client = settings.endpoint, settings.token, settings.stream
-    
-    if cache_entry is None:
-        if not body.prompt:
-            raise HTTPException(422, 'A prompt is required.')
-        if not body.model:
-            raise HTTPException(422, 'A model is required.')
-        if not settings.endpoint or not settings.token:
-            raise HTTPException(503, 'TOKEN and ENDPOINT are required.')
-        
-        messages = [{'role': 'user', 'content': body.prompt}]
-        if body.followup:
-            if not body.previous:
-                raise HTTPException(400, 'A completed response is required before following up.')
-            messages += [{'role': 'assistant', 'content': body.previous}, {'role': 'user', 'content': body.followup}]
+# ---------------------------------------------------------------- fence extraction
+
+def extract_block(text, open_tag, close_tag):
+    """Content between e.g. ```material ... endmaterial```. None when no fence at all."""
+    t = text.replace('\r\n', '\n').replace('\r', '\n')
+    word = close_tag[:-3]  # 'endmaterial' / 'endquiz'
+    t = re.sub(re.escape(word) + r'[ \t]*\n[ \t]*```', close_tag, t)
+    t = re.sub(r'```[ \t]*\n[ \t]*' + re.escape(open_tag[3:]), open_tag, t)
+    i = t.find(open_tag)
+    if i == -1:
+        return None
+    start = i + len(open_tag)
+    if t.startswith('\n', start):
+        start += 1
+    j = t.find(close_tag, start)
+    if j == -1:
+        return t[start:].strip()
+    return t[start:j].strip()
+
+
+# ---------------------------------------------------------------- quiz repair (ported from quiz.html)
+
+def find_next_non_space(text, start_index):
+    for i in range(start_index, len(text)):
+        if not text[i].isspace():
+            return text[i]
+    return ''
+
+
+def replace_smart_quotes(text):
+    return (text.replace('\u201c', '"').replace('\u201d', '"')
+                .replace('\u2018', "'").replace('\u2019', "'"))
+
+
+def strip_code_fence_noise(text):
+    text = re.sub(r'^\s*```(?:json|javascript|js)?\s*', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'\s*```\s*$', '', text, flags=re.IGNORECASE)
+    return text
+
+
+def convert_single_quoted_strings(text):
+    def repl(match):
+        value = match.group(1).replace("\\'", "'").replace('\\n', '\n')
+        return json.dumps(value, ensure_ascii=False)
+    return re.sub(r"'([^'\\]*(?:\\.[^'\\]*)*)'", repl, text)
+
+
+def quote_unquoted_keys(text):
+    def repl(match):
+        return match.group(1) + json.dumps(match.group(2)) + match.group(3)
+    return re.sub(r'([{,]\s*)([A-Za-z_$][A-Za-z0-9_$-]*)(\s*:)', repl, text)
+
+
+def quote_unquoted_simple_values(text):
+    def repl(match):
+        raw_value, spacing = match.group(1), match.group(2)
+        value = raw_value.strip()
+        if value == '':
+            return ': ' + raw_value + spacing
+        if re.match(r'^-?\d+(\.\d+)?([eE][+-]?\d+)?$', value):
+            return ': ' + value + spacing
+        if re.match(r'^(true|false|null)$', value, re.IGNORECASE):
+            return ': ' + value.lower() + spacing
+        return ': ' + json.dumps(value, ensure_ascii=False) + spacing
+    return re.sub(r':\s*([^"\{\[\]\},\n][^,\}\]\n]*?)(\s*)(?=,|\}|\])', repl, text)
+
+
+def escape_bad_characters_inside_strings(text):
+    result = []
+    in_string = False
+    escaped = False
+    for i, ch in enumerate(text):
+        if not in_string:
+            result.append(ch)
+            if ch == '"':
+                in_string = True
+                escaped = False
+            continue
+        if escaped:
+            result.append(ch)
+            escaped = False
+            continue
+        if ch == '\\':
+            result.append(ch)
+            escaped = True
+            continue
+        if ch == '"':
+            next_non_space = find_next_non_space(text, i + 1)
+            if next_non_space in (',', '}', ']', ':', ''):
+                result.append(ch)
+                in_string = False
+            else:
+                result.append('\\"')
+            continue
+        if ch == '\n':
+            result.append('\\n')
+            continue
+        if ch == '\t':
+            result.append('\\t')
+            continue
+        result.append(ch)
+    return ''.join(result)
+
+
+def remove_trailing_commas(text):
+    previous = None
+    while previous != text:
+        previous = text
+        text = re.sub(r',\s*([}\]])', r'\1', text)
+    return text
+
+
+def repair_json_like_text(text):
+    result = text.replace('\ufeff', '')
+    result = result.replace('\r\n', '\n').replace('\r', '\n')
+    result = replace_smart_quotes(result)
+    result = strip_code_fence_noise(result)
+    result = convert_single_quoted_strings(result)
+    result = quote_unquoted_keys(result)
+    result = quote_unquoted_simple_values(result)
+    result = escape_bad_characters_inside_strings(result)
+    result = remove_trailing_commas(result)
+    return result.strip()
+
+
+def parse_possibly_broken_json(text):
+    attempts = [text, repair_json_like_text(text), repair_json_like_text(repair_json_like_text(text))]
+    last_error = None
+    for attempt in attempts:
+        try:
+            return json.loads(attempt)
+        except ValueError as exc:
+            last_error = exc
+    raise ValueError('Phân tích JSON thất bại: ' + str(last_error))
+
+
+def validate_quiz(value):
+    if not isinstance(value, list):
+        raise ValueError('Khối trắc nghiệm không chứa mảng JSON.')
+    for i, question in enumerate(value, 1):
+        if not isinstance(question, dict):
+            raise ValueError(f'Câu #{i} không phải là một object.')
+        if 'question' not in question:
+            raise ValueError(f'Câu #{i} thiếu nội dung đề bài.')
+        options = question.get('options')
+        if not isinstance(options, list):
+            raise ValueError(f'Câu #{i} thiếu mảng đáp án.')
+        if len(options) != 4:
+            raise ValueError(f'Câu #{i} phải có đúng 4 đáp án.')
+        for j, option in enumerate(options, 1):
+            if not isinstance(option, dict):
+                raise ValueError(f'Câu #{i}, đáp án #{j} không phải là một object.')
+            if 'label' not in option or 'value' not in option:
+                raise ValueError(f'Câu #{i}, đáp án #{j} thiếu label hoặc value.')
+        if 'correct' not in question:
+            raise ValueError(f'Câu #{i} thiếu đáp án đúng.')
+        correct = str(question['correct'])
+        matches = sum(1 for option in options if str(option['value']) == correct)
+        if matches != 1:
+            raise ValueError(f'Đáp án đúng của câu #{i} không khớp đúng với một giá trị đáp án: {json.dumps(question["correct"], ensure_ascii=False)}')
+    return value
+
+
+def normalize_quiz(parsed, do_randomize):
+    questions = []
+    for question in parsed:
+        options = list(question['options'])
+        if do_randomize:
+            random.shuffle(options)
+        correct = str(question['correct'])
+        new_correct = ''
+        new_options = []
+        for index, option in enumerate(options):
+            label = OPTION_VALUES[index]
+            if str(option['value']) == correct:
+                new_correct = label
+            new_options.append({'label': option['label'], 'value': label})
+        questions.append({
+            'id': 0,
+            'question': question['question'],
+            'options': new_options,
+            'correct': new_correct,
+            'explanation': question.get('explanation', ''),
+        })
+    if do_randomize:
+        random.shuffle(questions)
+    for index, question in enumerate(questions, 1):
+        question['id'] = index
+    return questions
+
+
+# ---------------------------------------------------------------- share
+
+async def share_state(cfg, state):
+    backend = cfg['quiz_backend_base'].rstrip('/')
+    detail_prefix = f'Không tạo được liên kết học (quiz backend tại {backend})'
+    try:
+        response = await app.state.direct_client.post(backend + '/newmaterial', json={'text': json.dumps(state, ensure_ascii=False)})
+    except httpx.HTTPError as exc:
+        raise PipelineError(f'{detail_prefix}: {exc.__class__.__name__}: {exc}') from exc
+    if response.is_error:
+        raise PipelineError(f'{detail_prefix}: HTTP {response.status_code} {response.text.strip()[:200]}')
+    try:
+        data = response.json()
+        material_id = data['id']
+    except (ValueError, KeyError, TypeError) as exc:
+        raise PipelineError(f'{detail_prefix}: phản hồi không hợp lệ.') from exc
+    if not isinstance(material_id, str) or len(material_id) != 6:
+        raise PipelineError(f'{detail_prefix}: mã trả về không hợp lệ.')
+    return cfg['quiz_frontend_base'].rstrip('/') + '/' + material_id
+
+
+# ---------------------------------------------------------------- generation pipeline
+
+async def run_pipeline(queue, user_input):
+    cfg = load_config()
+    user_input = user_input or ''
+    if not user_input.strip():
+        raise PipelineError('Hãy nhập nội dung bạn muốn học.')
+    steps = cfg['steps']
+
+    material_text = user_input
+    if steps['material']['enabled']:
+        await queue.put({'stage': 'material'})
+        reply = await ai_call(steps['material']['template'] + '\n\n' + user_input)
+        extracted = extract_block(reply, '```material', 'endmaterial```')
+        material_text = extracted if extracted is not None else reply
+        if not material_text.strip():
+            raise PipelineError('Mô hình không trả về khối học liệu nào.')
+
+    questions = []
+    if steps['quiz']['enabled']:
+        await queue.put({'stage': 'quiz'})
+        reply = await ai_call(steps['quiz']['template'] + '\n\n' + material_text)
+        extracted = extract_block(reply, '```quiz', 'endquiz```')
+        raw_quiz = extracted if extracted is not None else reply
+        try:
+            parsed = parse_possibly_broken_json(raw_quiz)
+            validate_quiz(parsed)
+        except ValueError as exc:
+            print('[trắc nghiệm] nội dung khối trắc nghiệm thô như sau', file=sys.stderr)
+            print(raw_quiz, file=sys.stderr)
+            raise PipelineError('Không phân tích được nội dung trắc nghiệm: ' + str(exc))
+        questions = normalize_quiz(parsed, bool(cfg['randomize']))
+
+    if steps['interactive']['enabled']:
+        await queue.put({'stage': 'interactive'})
+        reply = await ai_call(steps['interactive']['template'] + '\n\n' + material_text)
+        extracted = extract_block(reply, '```material', 'endmaterial```')
+        replacement = extracted if extracted is not None else reply
+        if replacement.strip():
+            material_text = replacement
+
+    await queue.put({'stage': 'share'})
+    state = {
+        'version': '1.0',
+        'material': material_text,
+        'questions': questions,
+        'originalMessage': user_input,
+        'timestamp': int(time.time() * 1000),
+    }
+    return await share_state(cfg, state)
+
+
+class GenerateRequest(BaseModel):
+    input: str | None = Field(default=None, max_length=1000000)
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_handler(request, exc):
+    print('[request] validation error:', exc.errors(), file=sys.stderr)
+    for err in exc.errors():
+        if err.get('type') == 'string_too_long':
+            return JSONResponse(status_code=422, content={'detail': 'Nội dung quá dài (giới hạn 1.000.000 ký tự).'})
+    return JSONResponse(status_code=422, content={'detail': 'Dữ liệu gửi lên không hợp lệ. Vui lòng thử lại.'})
+
+
+@app.post('/api/generate')
+async def generate(body: GenerateRequest | None = None):
+    queue = asyncio.Queue()
+
+    async def produce():
+        try:
+            link = await run_pipeline(queue, body.input if body else '')
+            await queue.put({'done': True, 'link': link})
+        except PipelineError as exc:
+            await queue.put({'error': str(exc)})
+        except Exception:
+            import traceback
+            traceback.print_exc()
+            await queue.put({'error': 'Tạo nội dung thất bại ngoài dự kiến.'})
+        await queue.put(None)
+
+    async def ping():
+        try:
+            while True:
+                await asyncio.sleep(10)
+                await queue.put({'ping': True})
+        except asyncio.CancelledError:
+            pass
+
+    producer = asyncio.create_task(produce())
+    pinger = asyncio.create_task(ping())
 
     async def events():
-        def event(data):
-            return json.dumps(data) + '\n'
-        
-        if cache_entry is not None:
-            import sys, time
-            print(f"[chat] Using cache_id={body.cache_id}, completed={cache_entry['completed']}, chunks={len(cache_entry['chunks'])}", file=sys.stderr)
-            # First byte immediately so the client never stares at a dead connection.
-            yield event({'ping': True})
-            sent_chunks = 0
-            last_ping = time.monotonic()
-            while True:
-                while sent_chunks < len(cache_entry['chunks']):
-                    chunk = cache_entry['chunks'][sent_chunks]
-                    if to_client:
-                        yield event({'text': chunk})
-                    sent_chunks += 1
-                    last_ping = time.monotonic()
-                
-                if cache_entry['completed']:
-                    print(f"[chat] Cache completed, error={cache_entry['error']}, total_chunks={sent_chunks}", file=sys.stderr)
-                    if cache_entry['error']:
-                        yield event({'error': cache_entry['error']})
-                    else:
-                        if not to_client and cache_entry['chunks']:
-                            full_text = ''.join(cache_entry['chunks'])
-                            yield event({'text': full_text})
-                        yield event({'done': True})
-                    return
-                
-                if time.monotonic() - last_ping > 10:
-                    # Still thinking upstream; keep the connection visibly alive.
-                    yield event({'ping': True})
-                    last_ping = time.monotonic()
-                await asyncio.sleep(0.1)
-        
-        full = ''
         try:
-            async with api_client().stream('POST', endpoint, headers={'Authorization': f'Bearer {token}'}, json={
-                'model': body.model, 'messages': messages, 'stream': True,
-            }) as response:
-                if response.is_error:
-                    await response.aread()
-                    yield event({'error': f'API returned HTTP {response.status_code}. Check the endpoint, model, and token.'})
-                    return
-                if 'application/json' in response.headers.get('content-type', ''):
-                    data = json.loads(await response.aread())
-                    text = data['choices'][0]['message'].get('content') or ''
-                    yield event({'text': text})
-                    yield event({'done': True})
-                    return
-                finished = False
-                async for line in response.aiter_lines():
-                    if not line.startswith('data:'):
-                        continue
-                    payload = line[5:].strip()
-                    if payload == '[DONE]':
-                        finished = True
-                        break
-                    data = json.loads(payload)
-                    if data.get('error'):
-                        yield event({'error': 'The provider reported a generation error. Please retry.'})
-                        return
-                    for choice in data.get('choices', []):
-                        text = choice.get('delta', {}).get('content')
-                        if text:
-                            full += text
-                            if to_client:
-                                yield event({'text': text})
-                        if choice.get('finish_reason'):
-                            finished = True
-                if finished:
-                    if not to_client and full:
-                        yield event({'text': full})
-                    yield event({'done': True})
-                else:
-                    yield event({'error': 'The stream ended unexpectedly. Partial output is preserved.'})
-        except httpx.HTTPError:
-            yield event({'error': 'Connection failed or timed out. Check the configured proxy and endpoint. Partial output is preserved.'})
-        except (ValueError, KeyError, TypeError):
-            yield event({'error': 'The endpoint returned an unexpected response format.'})
+            while True:
+                item = await queue.get()
+                if item is None:
+                    break
+                yield json.dumps(item, ensure_ascii=False) + '\n'
+        finally:
+            pinger.cancel()
+            producer.cancel()
+
     return StreamingResponse(events(), media_type='application/x-ndjson', headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'})
