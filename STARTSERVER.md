@@ -47,4 +47,7 @@ Configure the API endpoint and key through the Settings page. The app saves thes
 
 AI requests use the proxy `http://127.0.0.1:3128` by default. Ensure it is running, or configure `PROXY` in `.env` and restart the server. Set `PROXY=` to use a direct connection.
 
-File import uses MarkItDown with all optional Python dependencies. Some audio conversions additionally require FFmpeg.
+File import uses MarkItDown with the document, audio and YouTube extras installed from `requirements.txt`
+(`pptx`, `docx`, `xlsx`, `xls`, `pdf`, `audio-transcription`, `youtube-transcription`). Some audio
+conversions additionally require FFmpeg. Images are not converted or OCR'd: the browser reads them as
+data URLs and they are sent straight to the model.

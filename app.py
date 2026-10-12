@@ -4,7 +4,10 @@ import json
 import os
 import random
 import re
+import shutil
 import sys
+import tempfile
+import threading
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -12,10 +15,11 @@ from urllib.parse import urlsplit
 
 import httpx
 from dotenv import load_dotenv, set_key
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field, field_validator
 
 from default_config import DEFAULT_CONFIG
 
@@ -25,6 +29,7 @@ load_dotenv(ROOT / '.env')
 CONFIG_PATH = ROOT / 'configure.json'
 EFFORTS = {'off': 'Off', 'low': 'Low', 'medium': 'Medium', 'high': 'High'}
 OPTION_VALUES = ['A', 'B', 'C', 'D']
+MAX_REQUEST_BYTES = 50 * 1024 * 1024
 
 
 def normalize_endpoint(endpoint):
@@ -76,6 +81,18 @@ def api_client():
 app = FastAPI(title='Cret2', lifespan=lifespan)
 
 
+@app.middleware('http')
+async def limit_request_size(request, call_next):
+    """Cap the whole request body: attached images arrive base64-inflated."""
+    try:
+        length = int(request.headers.get('content-length') or 0)
+    except ValueError:
+        length = 0
+    if length > MAX_REQUEST_BYTES:
+        return JSONResponse(status_code=413, content={'detail': 'Nội dung yêu cầu quá lớn (tối đa 50 MiB).'})
+    return await call_next(request)
+
+
 # ---------------------------------------------------------------- pages
 
 @app.get('/')
@@ -91,6 +108,9 @@ async def settings_page():
 @app.get('/configure')
 async def configure_page():
     return FileResponse(ROOT / 'static' / 'configure.html')
+
+
+app.mount('/static', StaticFiles(directory=ROOT / 'static'))
 
 
 # ---------------------------------------------------------------- settings (.env)
@@ -226,17 +246,126 @@ async def save_configure(body: ConfigureRequest):
     return {'status': 'saved'}
 
 
+# ---------------------------------------------------------------- attachment conversion (MarkItDown)
+
+MAX_CONVERT_UPLOAD_BYTES = 25 * 1024 * 1024
+MAX_CONVERT_TEXT_CHARS = 1_000_000
+INVALID_LINK_ERROR = 'Liên kết YouTube không hợp lệ.'
+YOUTUBE_ID = r'[A-Za-z0-9_-]{5,}'
+YOUTUBE_HOSTS = {'youtube.com', 'www.youtube.com', 'm.youtube.com', 'youtu.be', 'www.youtu.be', 'm.youtu.be'}
+# Exactly the link shapes the composer accepts: /watch?v=, youtu.be/, /shorts/ and /embed/
+# (www. and m. tolerated, extra query parameters tolerated).
+YOUTUBE_PATTERNS = (
+    re.compile(rf'^https?://(?:www\.|m\.)?youtube\.com/watch/?\?(?:[^#]*&)?v={YOUTUBE_ID}(?:&[^#]*)?(?:#.*)?$', re.IGNORECASE),
+    re.compile(rf'^https?://(?:www\.|m\.)?youtu\.be/{YOUTUBE_ID}(?:\?[^#]*)?(?:#.*)?$', re.IGNORECASE),
+    re.compile(rf'^https?://(?:www\.|m\.)?youtube\.com/(?:shorts|embed)/{YOUTUBE_ID}(?:[?#].*)?$', re.IGNORECASE),
+)
+
+_markitdown = None
+_markitdown_lock = threading.Lock()
+
+
+def markitdown_reader():
+    """Shared MarkItDown instance, built lazily because it loads a detection model."""
+    global _markitdown
+    if _markitdown is None:
+        with _markitdown_lock:
+            if _markitdown is None:
+                from markitdown import MarkItDown
+                _markitdown = MarkItDown()
+    return _markitdown
+
+
+def markitdown_text(result):
+    return getattr(result, 'markdown', None) or result.text_content
+
+
+def convert_upload(path):
+    """Convert one uploaded file to Markdown/text. Blocking: call through asyncio.to_thread."""
+    return markitdown_text(markitdown_reader().convert_local(path))
+
+
+def convert_link(url):
+    """Convert one validated YouTube link to text. Blocking: call through asyncio.to_thread."""
+    return markitdown_text(markitdown_reader().convert(url))
+
+
+def youtube_source(value):
+    """Return the trimmed URL when `value` is exactly one supported YouTube link."""
+    raw = (value or '').strip()
+    if not raw or any(char.isspace() for char in raw):
+        raise ValueError(INVALID_LINK_ERROR)
+    if not any(pattern.match(raw) for pattern in YOUTUBE_PATTERNS):
+        raise ValueError(INVALID_LINK_ERROR)
+    if (urlsplit(raw).hostname or '').lower() not in YOUTUBE_HOSTS:
+        raise ValueError(INVALID_LINK_ERROR)
+    return raw
+
+
+def safe_upload_name(filename):
+    """Basename only: traversal-style names (../../x.txt) must never escape the temp folder."""
+    name = os.path.basename((filename or '').replace('\\', '/')).strip()
+    return name or 'upload'
+
+
+@app.post('/api/convert')
+async def convert_attachment(file: UploadFile | None = File(None), url: str | None = Form(None)):
+    """One attachment -> {"text": ...}: either a multipart upload or a YouTube link."""
+    has_file = file is not None
+    has_url = bool((url or '').strip())
+    if has_file == has_url:
+        raise HTTPException(400, 'Hãy chọn một tệp hoặc dán một liên kết YouTube.')
+
+    if has_file:
+        data = await file.read()
+        if not data:
+            raise HTTPException(400, 'Tệp rỗng, không có nội dung để chuyển đổi.')
+        if len(data) > MAX_CONVERT_UPLOAD_BYTES:
+            raise HTTPException(413, 'Tệp quá lớn (tối đa 25 MiB).')
+        directory = Path(tempfile.mkdtemp(prefix='cret2-convert-'))
+        try:
+            path = directory / safe_upload_name(file.filename)
+            path.write_bytes(data)
+            try:
+                text = await asyncio.to_thread(convert_upload, str(path))
+            except Exception as exc:
+                print(f'[chuyển đổi] lỗi khi đọc tệp: {exc.__class__.__name__}: {exc}', file=sys.stderr)
+                raise HTTPException(422, 'Không chuyển được tệp sang văn bản.')
+        finally:
+            shutil.rmtree(directory, ignore_errors=True)
+    else:
+        try:
+            source = youtube_source(url)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        try:
+            text = await asyncio.to_thread(convert_link, source)
+        except Exception as exc:
+            print(f'[chuyển đổi] lỗi khi đọc liên kết YouTube: {exc.__class__.__name__}: {exc}', file=sys.stderr)
+            raise HTTPException(422, 'Không chuyển được liên kết YouTube sang văn bản.')
+
+    if not isinstance(text, str) or not text.strip():
+        raise HTTPException(422, 'Nội dung sau khi chuyển đổi rỗng.')
+    if len(text) > MAX_CONVERT_TEXT_CHARS:
+        raise HTTPException(413, 'Nội dung sau khi chuyển đổi quá dài (tối đa 1.000.000 ký tự).')
+    return {'text': text}
+
+
 # ---------------------------------------------------------------- AI call
 
 class PipelineError(Exception):
     pass
 
 
-async def ai_call(user_message):
+async def ai_call(user_message, images=None):
     endpoint, token, model = settings.endpoint, settings.token, settings.model
     if not endpoint or not model:
         raise PipelineError('Chưa cấu hình AI. Mở trang /settings để đặt đường dẫn và tên mô hình.')
-    body = {'model': model, 'messages': [{'role': 'user', 'content': user_message}], 'stream': True}
+    # Multimodal turns send a content part array; plain turns keep the string form.
+    content = user_message
+    if images:
+        content = [{'type': 'text', 'text': user_message}] + [dict(part) for part in images]
+    body = {'model': model, 'messages': [{'role': 'user', 'content': content}], 'stream': True}
     effort = (settings.thinking_effort or 'Off').strip().lower()
     if effort and effort != 'off':
         body['reasoning_effort'] = effort
@@ -550,12 +679,133 @@ async def fetch_reference_material(cfg, code):
     return material
 
 
+# ---------------------------------------------------------------- quiz feedback repair
+
+QUIZ_REPAIR_ATTEMPTS = 2
+
+
+def build_quiz_repair_prompt(original_prompt, broken_reply, error_text):
+    """One feedback message: the original task, the exact broken reply, the exact error."""
+    return (
+        'Your previous answer to this quiz task failed the validation check.\n\n'
+        'TASK (original prompt):\n' + original_prompt + '\n\n'
+        'YOUR PREVIOUS ANSWER (broken output):\n' + broken_reply + '\n\n'
+        'VALIDATION ERROR:\n' + error_text + '\n\n'
+        'Fix the quiz so it passes the check. Return ONLY the corrected quiz in the same '
+        'contract: a single fenced block ```quiz ... endquiz``` containing a valid JSON '
+        'array of questions in Vietnamese, no extra text outside the fence.'
+    )
+
+
+# ---------------------------------------------------------------- generate request (input + attachments)
+
+MAX_INPUT_CHARS = 1_000_000
+MAX_ATTACHMENTS = 20
+MAX_IMAGES = 10
+MAX_IMAGE_RAW_BYTES = 20 * 1024 * 1024
+IMAGE_DATA_URL_RE = re.compile(r'^data:(image/(?:png|jpeg|webp|gif));base64,([A-Za-z0-9+/]+={0,2})$', re.IGNORECASE)
+
+
+class SourcePart(BaseModel):
+    """Text converted from one document, audio file or YouTube link."""
+
+    name: str = Field(default='', max_length=500)
+    text: str = Field(min_length=1, max_length=MAX_CONVERT_TEXT_CHARS)
+
+
+class ImageUrlPart(BaseModel):
+    url: str = Field(min_length=1, max_length=MAX_REQUEST_BYTES)
+
+
+class ImagePart(BaseModel):
+    type: str = 'image_url'
+    image_url: ImageUrlPart
+
+
+class GenerateRequest(BaseModel):
+    input: str | None = Field(default=None, max_length=MAX_INPUT_CHARS)
+    reference: str | None = Field(default=None, max_length=2000)
+    sources: list[SourcePart] = Field(default_factory=list)
+    images: list[ImagePart] = Field(default_factory=list)
+
+    @field_validator('sources', mode='before')
+    @classmethod
+    def _normalize_sources(cls, value):
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            return value
+        normalized = []
+        for item in value:
+            if isinstance(item, str):
+                normalized.append({'text': item})
+            elif isinstance(item, dict) and 'text' in item:
+                normalized.append({'name': str(item.get('name') or ''), 'text': item['text']})
+            else:
+                normalized.append(item)
+        return normalized
+
+    @field_validator('images', mode='before')
+    @classmethod
+    def _normalize_images(cls, value):
+        """Accept plain data URLs, {'data_url': ...} or OpenAI-style image content parts."""
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            return value
+        normalized = []
+        for item in value:
+            if isinstance(item, str):
+                normalized.append({'type': 'image_url', 'image_url': {'url': item}})
+            elif isinstance(item, dict):
+                if isinstance(item.get('data_url'), str):
+                    normalized.append({'type': 'image_url', 'image_url': {'url': item['data_url']}})
+                elif isinstance(item.get('image_url'), str):
+                    normalized.append({'type': 'image_url', 'image_url': {'url': item['image_url']}})
+                elif isinstance(item.get('image_url'), dict):
+                    normalized.append({'type': 'image_url', 'image_url': dict(item['image_url'])})
+                else:
+                    normalized.append(item)
+            else:
+                normalized.append(item)
+        return normalized
+
+
+def validate_attachments(body):
+    """Attachment caps and image checks; raises before any generation starts."""
+    sources, images = body.sources, body.images
+    if len(sources) + len(images) > MAX_ATTACHMENTS:
+        raise HTTPException(422, f'Tối đa {MAX_ATTACHMENTS} tệp đính kèm.')
+    if len(images) > MAX_IMAGES:
+        raise HTTPException(422, f'Tối đa {MAX_IMAGES} ảnh.')
+    for part in images:
+        match = IMAGE_DATA_URL_RE.match(part.image_url.url.strip())
+        if match is None or len(match.group(2)) % 4:
+            raise HTTPException(422, 'Ảnh không hợp lệ (chỉ chấp nhận PNG, JPEG, WebP, GIF dạng data URL).')
+        if len(match.group(2)) // 4 * 3 > MAX_IMAGE_RAW_BYTES:
+            raise HTTPException(413, 'Ảnh quá lớn (tối đa 20 MiB mỗi ảnh).')
+    return sources, images
+
+
+def join_source(user_input, sources):
+    """Typed input first, then the converted attachment text as source material, in insertion order."""
+    chunks = []
+    if (user_input or '').strip():
+        chunks.append(user_input.strip())
+    for source in sources:
+        text = (source.get('text') or '').strip()
+        if text:
+            chunks.append(text)
+    return '\n\n'.join(chunks)
+
+
 # ---------------------------------------------------------------- generation pipeline
 
-async def run_pipeline(queue, user_input, reference=''):
+async def run_pipeline(queue, user_input, reference='', images=None):
     cfg = load_config()
     user_input = user_input or ''
-    if not user_input.strip():
+    images = list(images or [])
+    if not user_input.strip() and not images:
         raise PipelineError('Hãy nhập nội dung bạn muốn học.')
     try:
         reference_code = parse_reference(reference)
@@ -563,6 +813,8 @@ async def run_pipeline(queue, user_input, reference=''):
         raise PipelineError(str(exc))
     reference_material = await fetch_reference_material(cfg, reference_code) if reference_code else ''
     steps = cfg['steps']
+    # Images ride along with the first enabled step that consumes the raw input.
+    image_step = next((name for name in ('material', 'quiz', 'interactive') if steps[name]['enabled']), None)
 
     material_text = user_input
     if steps['material']['enabled']:
@@ -570,7 +822,7 @@ async def run_pipeline(queue, user_input, reference=''):
         prompt = steps['material']['template'] + '\n\n' + user_input
         if reference_material:
             prompt += '\n\n' + REFERENCE_PROMPT_LABEL + '\n' + reference_material
-        reply = await ai_call(prompt)
+        reply = await ai_call(prompt, images if image_step == 'material' else None)
         extracted = extract_block(reply, '```material', 'endmaterial```')
         material_text = extracted if extracted is not None else reply
         if not material_text.strip():
@@ -579,21 +831,30 @@ async def run_pipeline(queue, user_input, reference=''):
     questions = []
     if steps['quiz']['enabled']:
         await queue.put({'stage': 'quiz'})
-        reply = await ai_call(steps['quiz']['template'] + '\n\n' + material_text)
-        extracted = extract_block(reply, '```quiz', 'endquiz```')
-        raw_quiz = extracted if extracted is not None else reply
-        try:
-            parsed = parse_possibly_broken_json(raw_quiz)
-            validate_quiz(parsed)
-        except ValueError as exc:
-            print('[trắc nghiệm] nội dung khối trắc nghiệm thô như sau', file=sys.stderr)
-            print(raw_quiz, file=sys.stderr)
-            raise PipelineError('Không phân tích được nội dung trắc nghiệm: ' + str(exc))
+        quiz_prompt = steps['quiz']['template'] + '\n\n' + material_text
+        quiz_images = images if image_step == 'quiz' else None
+        reply = await ai_call(quiz_prompt, quiz_images)
+        parsed = None
+        for attempt in range(QUIZ_REPAIR_ATTEMPTS + 1):
+            extracted = extract_block(reply, '```quiz', 'endquiz```')
+            raw_quiz = extracted if extracted is not None else reply
+            try:
+                parsed = parse_possibly_broken_json(raw_quiz)
+                validate_quiz(parsed)
+                break
+            except ValueError as exc:
+                print('[trắc nghiệm] nội dung khối trắc nghiệm thô như sau', file=sys.stderr)
+                print(raw_quiz, file=sys.stderr)
+                if attempt >= QUIZ_REPAIR_ATTEMPTS:
+                    raise PipelineError('Không phân tích được nội dung trắc nghiệm: ' + str(exc))
+                print(f'[trắc nghiệm] yêu cầu sửa lỗi lần {attempt + 1}/{QUIZ_REPAIR_ATTEMPTS}: {exc}', file=sys.stderr)
+                reply = await ai_call(build_quiz_repair_prompt(quiz_prompt, reply, str(exc)), quiz_images)
         questions = normalize_quiz(parsed, bool(cfg['randomize']))
 
     if steps['interactive']['enabled']:
         await queue.put({'stage': 'interactive'})
-        reply = await ai_call(steps['interactive']['template'] + '\n\n' + material_text)
+        reply = await ai_call(steps['interactive']['template'] + '\n\n' + material_text,
+                              images if image_step == 'interactive' else None)
         extracted = extract_block(reply, '```material', 'endmaterial```')
         replacement = extracted if extracted is not None else reply
         if replacement.strip():
@@ -610,11 +871,6 @@ async def run_pipeline(queue, user_input, reference=''):
     return await share_state(cfg, state)
 
 
-class GenerateRequest(BaseModel):
-    input: str | None = Field(default=None, max_length=1000000)
-    reference: str | None = Field(default=None, max_length=2000)
-
-
 @app.exception_handler(RequestValidationError)
 async def validation_handler(request, exc):
     print('[request] validation error:', exc.errors(), file=sys.stderr)
@@ -626,11 +882,19 @@ async def validation_handler(request, exc):
 
 @app.post('/api/generate')
 async def generate(body: GenerateRequest | None = None):
+    body = body or GenerateRequest()
+    sources, images = validate_attachments(body)
+    source_payload = [{'name': source.name, 'text': source.text} for source in sources]
+    image_payload = [part.model_dump() for part in images]
+    # Converted attachments land after the typed input, as extra source material.
+    material_input = join_source(body.input or '', source_payload)
+    if len(material_input) > MAX_INPUT_CHARS:
+        raise HTTPException(422, 'Nội dung quá dài (giới hạn 1.000.000 ký tự).')
     queue = asyncio.Queue()
 
     async def produce():
         try:
-            link = await run_pipeline(queue, body.input if body else '', body.reference if body else '')
+            link = await run_pipeline(queue, material_input, body.reference or '', image_payload)
             await queue.put({'done': True, 'link': link})
         except PipelineError as exc:
             await queue.put({'error': str(exc)})

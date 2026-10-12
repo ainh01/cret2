@@ -39,6 +39,36 @@
     display: inline-flex; align-items: center; gap: 10px;
   }
   button:disabled { opacity: 0.6; cursor: default; }
+  button.secondary {
+    margin-top: 12px; padding: 8px 18px; font-size: 0.95rem; font-weight: 500;
+    color: #C5CAE9; background: transparent;
+    border: 1px solid rgba(255,255,255,0.25);
+  }
+  button.secondary:hover { color: #fff; border-color: #7C4DFF; }
+  ul#attachments {
+    list-style: none; margin: 12px 0 0; padding: 0;
+    display: grid; gap: 8px;
+  }
+  ul#attachments[hidden] { display: none; }
+  li.attachment {
+    display: flex; align-items: center; gap: 10px;
+    padding: 8px 12px; font-size: 0.9rem;
+    background: #1E1E2E; border: 1px solid rgba(255,255,255,0.12); border-radius: 10px;
+  }
+  li.attachment .tag {
+    flex: none; padding: 2px 8px; border-radius: 999px; font-size: 0.75rem;
+    background: rgba(124,77,255,0.25); color: #D1C4E9;
+  }
+  li.attachment .name {
+    flex: 1; min-width: 0;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  li.attachment .size { flex: none; color: #9FA8DA; font-size: 0.8rem; }
+  li.attachment .remove {
+    flex: none; margin: 0; padding: 0 8px; font-size: 1.1rem; line-height: 1.5;
+    color: #FF8A80; background: transparent;
+  }
+  li.attachment .remove:hover { color: #fff; }
   .spinner {
     width: 16px; height: 16px; border-radius: 50%;
     border: 2px solid rgba(255,255,255,0.35); border-top-color: #fff;
@@ -61,6 +91,12 @@
 
   <textarea id="input" placeholder="Bạn muốn học gì?"></textarea>
 
+  <ul id="attachments" hidden></ul>
+
+  <button id="addFiles" class="secondary" type="button">Thêm file</button>
+  <input id="filePicker" type="file" multiple hidden
+         accept=".pdf,.docx,.doc,.pptx,.ppt,.xlsx,.xls,.csv,.txt,.md,.html,.htm,.xml,.json,.epub,.ipynb,.wav,.mp3,.png,.jpg,.jpeg,.webp,.gif">
+
   <input id="reference" type="text" autocomplete="off" spellcheck="false" placeholder="Link tham chiếu">
 
   <br>
@@ -74,6 +110,7 @@
   <div id="link"></div>
 </main>
 
+<script src="/static/attachments.js"></script>
 <script>
   const inputEl = document.getElementById('input');
   const referenceEl = document.getElementById('reference');
@@ -81,6 +118,12 @@
   const statusEl = document.getElementById('status');
   const errorEl = document.getElementById('error');
   const linkEl = document.getElementById('link');
+  const addFilesBtn = document.getElementById('addFiles');
+  const filePicker = document.getElementById('filePicker');
+  const attachmentsEl = document.getElementById('attachments');
+
+  // Attachments live here only: adding or removing one never touches the network.
+  const store = newAttachmentStore();
 
   const STAGES = {
     material: 'Đang viết học liệu...',
@@ -118,9 +161,112 @@
     return String(detail);
   }
 
+  function escapeHtml(value) {
+    const map = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+    return String(value == null ? '' : value).replace(/[&<>"']/g, char => map[char]);
+  }
+
+  // ---- attachment list (local only) ----
+
+  function renderAttachments() {
+    attachmentsEl.hidden = store.items.length === 0;
+    attachmentsEl.innerHTML = store.items.map(item => (
+      '<li class="attachment">' +
+        '<span class="tag">' + escapeHtml(attachmentTypeLabel(item)) + '</span>' +
+        '<span class="name" title="' + escapeHtml(item.name) + '">' + escapeHtml(item.name) + '</span>' +
+        '<span class="size">' + escapeHtml(attachmentSizeLabel(item)) + '</span>' +
+        '<button type="button" class="remove" data-remove="' + item.id + '" title="Xóa" aria-label="Xóa">×</button>' +
+      '</li>'
+    )).join('');
+  }
+
+  function addItem(item) {
+    const result = addAttachment(store, item);
+    if (result.error) {
+      errorEl.textContent = result.error;
+      return null;
+    }
+    errorEl.textContent = '';
+    renderAttachments();
+    return result.item;
+  }
+
+  function addFiles(files) {
+    for (const file of files) {
+      addItem({
+        kind: attachmentKind(file),
+        name: file.name || 'tệp đính kèm',
+        size: file.size || 0,
+        mime: file.type || '',
+        file: file,
+      });
+    }
+  }
+
+  addFilesBtn.addEventListener('click', () => filePicker.click());
+  filePicker.addEventListener('change', () => {
+    addFiles(Array.from(filePicker.files || []));
+    filePicker.value = '';
+  });
+
+  attachmentsEl.addEventListener('click', (event) => {
+    const button = event.target && event.target.closest ? event.target.closest('[data-remove]') : null;
+    if (!button) return;
+    removeAttachment(store, button.getAttribute('data-remove'));
+    renderAttachments();
+  });
+
+  // Ctrl+V anywhere in the composer: a clipboard image or a lone YouTube link
+  // becomes an attachment, everything else pastes into the textarea as usual.
+  document.addEventListener('paste', (event) => {
+    const clipboard = event.clipboardData;
+    if (!clipboard) return;
+    const files = Array.from(clipboard.files || []);
+    const plan = planPaste(event.target && event.target.id, files, clipboard.getData('text'));
+    if (plan.action === 'image') {
+      event.preventDefault();
+      const file = files[plan.index];
+      addItem({
+        kind: 'image',
+        name: file.name || 'ảnh-dán.png',
+        size: file.size || 0,
+        mime: file.type || '',
+        file: file,
+      });
+    } else if (plan.action === 'youtube') {
+      event.preventDefault();
+      addItem({ kind: 'youtube', name: plan.url, size: 0, url: plan.url });
+    }
+  });
+
+  // ---- conversion (only reached from "Học") ----
+
+  async function convertAttachment(item) {
+    const form = new FormData();
+    if (item.kind === 'youtube') form.append('url', item.url);
+    else form.append('file', item.file, item.name);
+    const response = await fetch('/api/convert', { method: 'POST', body: form });
+    if (!response.ok) {
+      let detail = '';
+      try { detail = formatDetail((await response.json()).detail); } catch (e) {}
+      throw new Error(detail || ('Lỗi máy chủ (HTTP ' + response.status + ')'));
+    }
+    return (await response.json()).text;
+  }
+
+  function readImageDataUrl(file) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result));
+      reader.onerror = () => reject(new Error('Không đọc được ảnh.'));
+      reader.readAsDataURL(file);
+    });
+  }
+
   learnBtn.addEventListener('click', async () => {
-    const raw = inputEl.value;
-    if (!raw.trim()) {
+    const typed = inputEl.value;
+    const plan = submissionPlan(store);
+    if (!typed.trim() && !plan.length) {
       errorEl.textContent = 'Hãy nhập nội dung bạn muốn học.';
       return;
     }
@@ -133,13 +279,35 @@
 
     errorEl.textContent = '';
     linkEl.innerHTML = '';
-    statusEl.textContent = 'Đang bắt đầu...';
+    statusEl.textContent = plan.length ? 'Đang chuyển đổi tệp đính kèm...' : 'Đang bắt đầu...';
     learnBtn.disabled = true;
     learnBtn.classList.add('loading');
 
     try {
-      const payload = { input: raw };
+      const sources = [];
+      const images = [];
+      for (const item of plan) {
+        if (item.kind === 'image') {
+          // Images are never converted or OCR'd: they travel to the model as-is.
+          images.push({ type: 'image_url', image_url: { url: await readImageDataUrl(item.file) } });
+          continue;
+        }
+        let text;
+        try {
+          text = await convertAttachment(item);
+        } catch (err) {
+          const label = item.kind === 'youtube' ? 'Không chuyển được video YouTube ' : 'Không chuyển được tệp ';
+          throw new Error(label + '"' + item.name + '". ' + (err.message || ''));
+        }
+        sources.push({ name: item.name, text: text });
+      }
+
+      statusEl.textContent = 'Đang bắt đầu...';
+      const payload = { input: typed };
       if (reference.code) payload.reference = reference.code;
+      if (sources.length) payload.sources = sources;
+      if (images.length) payload.images = images;
+
       const response = await fetch('/api/generate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -191,6 +359,8 @@
       learnBtn.classList.remove('loading');
     }
   });
+
+  renderAttachments();
 </script>
 </body>
 </html>
