@@ -492,19 +492,85 @@ async def share_state(cfg, state):
     return cfg['quiz_frontend_base'].rstrip('/') + '/' + material_id
 
 
+# ---------------------------------------------------------------- reference (existing vtask.fun lesson)
+
+REFERENCE_LINK_RE = re.compile(r'^https://vtask\.fun/(?P<path>[^?#]*)$', re.IGNORECASE)
+REFERENCE_CODE_RE = re.compile(r'^[A-Za-z0-9_-]{6}$')
+REFERENCE_INVALID_ERROR = 'Liên kết tham chiếu không hợp lệ.'
+REFERENCE_PROMPT_LABEL = (
+    'REFERENCE MATERIAL (existing lesson; use it to clarify and deepen the specific hard part '
+    "of the user's topic; keep its technical terms/notation consistent; do NOT copy its quiz):"
+)
+
+
+def parse_reference(value):
+    """Resolve an optional reference to its 6-character lesson code.
+
+    Accepts exactly two forms: the full link https://vtask.fun/<code> (whitespace
+    and a trailing slash tolerated) or a bare code such as UmezbI. Returns '' for
+    an empty value and raises ValueError(REFERENCE_INVALID_ERROR) for anything else.
+    """
+    raw = re.sub(r'\s+', '', value or '')
+    if not raw:
+        return ''
+    match = REFERENCE_LINK_RE.match(raw)
+    if match:
+        segments = [segment for segment in match.group('path').split('/') if segment]
+        code = segments[-1] if segments else ''
+    else:
+        code = raw
+    if not REFERENCE_CODE_RE.match(code):
+        raise ValueError(REFERENCE_INVALID_ERROR)
+    return code
+
+
+async def fetch_reference_material(cfg, code):
+    """Load the lesson state for `code` and return ONLY its "material" text.
+
+    The state's "questions" (quiz) part is deliberately never used.
+    """
+    backend = cfg['quiz_backend_base'].rstrip('/')
+    detail_prefix = f'Không tải được bài tham chiếu (quiz backend tại {backend})'
+    try:
+        response = await app.state.direct_client.get(backend + '/material/' + code)
+    except httpx.HTTPError as exc:
+        raise PipelineError(f'{detail_prefix}: {exc.__class__.__name__}: {exc}') from exc
+    if response.status_code == 404:
+        raise PipelineError(f'Không tìm thấy bài tham chiếu với mã {code}.')
+    if response.is_error:
+        raise PipelineError(f'{detail_prefix}: HTTP {response.status_code} {response.text.strip()[:200]}')
+    try:
+        payload = response.json()
+        state = json.loads(payload['text'])
+    except (ValueError, KeyError, TypeError) as exc:
+        raise PipelineError(f'{detail_prefix}: phản hồi không hợp lệ.') from exc
+    material = state.get('material') if isinstance(state, dict) else None
+    if not isinstance(material, str) or not material.strip():
+        raise PipelineError(f'Bài tham chiếu với mã {code} không chứa nội dung học liệu hợp lệ.')
+    return material
+
+
 # ---------------------------------------------------------------- generation pipeline
 
-async def run_pipeline(queue, user_input):
+async def run_pipeline(queue, user_input, reference=''):
     cfg = load_config()
     user_input = user_input or ''
     if not user_input.strip():
         raise PipelineError('Hãy nhập nội dung bạn muốn học.')
+    try:
+        reference_code = parse_reference(reference)
+    except ValueError as exc:
+        raise PipelineError(str(exc))
+    reference_material = await fetch_reference_material(cfg, reference_code) if reference_code else ''
     steps = cfg['steps']
 
     material_text = user_input
     if steps['material']['enabled']:
         await queue.put({'stage': 'material'})
-        reply = await ai_call(steps['material']['template'] + '\n\n' + user_input)
+        prompt = steps['material']['template'] + '\n\n' + user_input
+        if reference_material:
+            prompt += '\n\n' + REFERENCE_PROMPT_LABEL + '\n' + reference_material
+        reply = await ai_call(prompt)
         extracted = extract_block(reply, '```material', 'endmaterial```')
         material_text = extracted if extracted is not None else reply
         if not material_text.strip():
@@ -546,6 +612,7 @@ async def run_pipeline(queue, user_input):
 
 class GenerateRequest(BaseModel):
     input: str | None = Field(default=None, max_length=1000000)
+    reference: str | None = Field(default=None, max_length=2000)
 
 
 @app.exception_handler(RequestValidationError)
@@ -563,7 +630,7 @@ async def generate(body: GenerateRequest | None = None):
 
     async def produce():
         try:
-            link = await run_pipeline(queue, body.input if body else '')
+            link = await run_pipeline(queue, body.input if body else '', body.reference if body else '')
             await queue.put({'done': True, 'link': link})
         except PipelineError as exc:
             await queue.put({'error': str(exc)})
