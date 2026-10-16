@@ -4,6 +4,7 @@
 <head>
   <meta charset="utf-8">
   <title>Quiz Parser and Randomizer</title>
+  <link rel="stylesheet" href="static/style.css">
 </head>
 <body>
   <div>
@@ -39,6 +40,7 @@
         const text = await navigator.clipboard.readText();
         inputText.value = text;
       } catch (error) {
+        outputText.classList.add("is-error"); /* styling hook only: error state */
         outputText.value = "Clipboard paste failed.\n\nYour browser may require clipboard permission or a secure context.\n\nDetails: " + error.message;
       }
     });
@@ -52,6 +54,7 @@
           outputText.select();
           document.execCommand("copy");
         } catch (fallbackError) {
+          outputText.classList.add("is-error"); /* styling hook only: error state */
           outputText.value = "Clipboard copy failed.\n\nDetails: " + error.message;
         }
       }
@@ -60,8 +63,10 @@
     parseButton.addEventListener("click", function () {
       try {
         const result = processInput(inputText.value, randomizeQuestions.checked);
+        outputText.classList.remove("is-error"); /* styling hook only: clears error state */
         outputText.value = result;
       } catch (error) {
+        outputText.classList.add("is-error"); /* styling hook only: error state */
         outputText.value = error.message;
       }
     });
