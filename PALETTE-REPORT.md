@@ -4,15 +4,19 @@ Re-skin of the four pages (`static/home.html`, `static/settings.html`, `static/c
 onto the required four-hue palette. Styling only: no markup restructuring, no class renames, no content or
 JavaScript-behaviour changes.
 
+> **Part 1** below covers the original light palette. **Part 2** (further down) adds the dark theme, which is
+> now the default, plus the light/dark switch. Read Part 2 for the current state of the app.
+
 **Files changed**
 
 | File | Change |
 | --- | --- |
-| `static/style.css` | Rewritten. Palette token block first, then shared base + all interactive states, then a section per page, then the legacy workspace surface. |
-| `static/home.html` | Inline dark-purple `<style>` block replaced by `<link rel="stylesheet" href="/static/style.css">`. Markup and script untouched. |
-| `static/settings.html` | Same substitution. |
-| `static/configure.html` | Same substitution. |
-| `quiz.html` | Added the stylesheet link. Three `outputText.classList` lines added — the only JS change — so the page's error state has a styling hook (it had none). |
+| `static/style.css` | Rewritten. Palette token block first, then shared base + all interactive states, then a section per page, then the legacy workspace surface. Part 2 adds the dark token block and the switch. |
+| `static/home.html` | Inline dark-purple `<style>` block replaced by `<link rel="stylesheet" href="/static/style.css">`. Markup and script untouched. Part 2 adds `data-theme`, the theme script and the switch. |
+| `static/settings.html` | Same substitution, same Part 2 additions. |
+| `static/configure.html` | Same substitution, same Part 2 additions. |
+| `quiz.html` | Added the stylesheet link. Three `outputText.classList` lines added — the only JS change — so the page's error state has a styling hook (it had none). Part 2 adds `data-theme`, the theme script and the switch. |
+| `static/theme.js` | New (Part 2): remembers the chosen theme and wires the switch. |
 | `PALETTE-REPORT.md` | This report. |
 
 **Palette and role map**
@@ -138,3 +142,122 @@ UI components / boundaries — threshold 3:1:
 - `--brand-pale` at full strength is used for panels, banners, stripes and disabled fills, exactly as the role
   map asks. It reads as a saturated cyan on large surfaces; the derived `--surface-soft` is used only where a
   quieter tint is needed (toolbar, code blocks).
+
+---
+
+# Part 2 — dark theme (now the default) + light/dark switch
+
+**Dark palette as given:** `#5003C0` `rgb(80, 3, 192)` · `#AB03A9` `rgb(171, 3, 169)` · `#FF467A` `rgb(255, 70, 122)` · `#FFD51E` `rgb(255, 213, 30)`.
+
+Dark is the default on first paint: the markup carries `data-theme="dark"` on `<html>`, so the page is dark
+with no JS and no flash even if scripts are off. `static/theme.js` only re-applies a remembered choice
+(`localStorage['cret2-theme']`) before the body parses, and wires the switch.
+
+**The switch** — one control per page, top-right of the content column:
+
+```html
+<div class="theme-bar">
+  <button class="theme-toggle" id="themeToggle" type="button" role="switch" aria-checked="true">Chế độ tối</button>
+</div>
+```
+
+It is a *switch*, not a label swap: the text stays `Chế độ tối`, `aria-checked` and `.is-on` report the state,
+and the dot turns accent-yellow while dark is on. Going back to light is a click away, and the choice survives
+a reload.
+
+**Dark role map** — same token names and the same jobs as Part 1, re-answered for a dark surface:
+
+| Given colour | Dark role | Where it is used |
+| --- | --- | --- |
+| `#5003C0` | **base surface** (the page itself) | page background; the app reads as this purple |
+| `#AB03A9` | **primary** | primary buttons (`Học`, `Lưu`, `Parse and Random`), checked fills, active states |
+| `#FF467A` | **secondary / highlight** | secondary buttons (`Thêm file`, `Paste`, `Copy Output`), hover fills, selected items, step dot |
+| `#FFD51E` | **accent / attention** | badges, error + warning banners, key metrics, focus accent, accent-as-text |
+
+**Derived dark values** (shades/tints of the same hues, plus white/lavender neutrals — no fifth hue):
+
+| Token | Value | Why it exists |
+| --- | --- | --- |
+| `--brand-pale` / `--surface-soft` / `--fill-info` | `#3A0191` | panel/banner/stripe layer, **darker** than the page |
+| `--surface` / `--fill-disabled` | `#2A0170` | field, code and output wells |
+| `--ink` | `#FFFFFF` | text |
+| `--muted` | `#CFC0F5` | secondary text (5.91:1 on the page) |
+| `--brand` | `#C9A8FF` | brand hue lightened so it reads on dark (4.98:1) — brand mark, indicators |
+| `--brand-strong` | `#D6BCFF` | links (5.91:1) |
+| `--brand-deep` | `#C704C4` | primary hover fill (white 4.95:1) |
+| `--edge-primary` | `#C7B2FF` | **the edge that makes a primary button exist** (see below) |
+| `--on-bright` | `#2A0413` | text on `#FF467A` (5.70:1) and on `#FFD51E` (13.14:1) |
+| `--line` / `--line-strong` | `#7B45E0` / `#C7B2FF` | separators / control borders (5.31:1 on the page) |
+| `--accent-wash` | `#4A0F3C` | invalid-field tint (white on it 14.74:1) |
+| `--inverse-surface` / `--shadow` | `#2A0170` / `rgba(0,0,0,.5)` | toast surface and depth |
+
+**Two design problems this palette creates, and how they are solved**
+
+1. **`#5003C0` and `#AB03A9` have nearly the same luminance (0.106 vs 0.116).** A magenta primary button on
+   the purple page is therefore invisible as a *shape*: 1.57:1. Every primary fill now carries
+   `--edge-primary` (light violet, 5.31:1 on the page) as its border, which is what identifies the control.
+   In light mode `--edge-primary` is `transparent`, so nothing about the light theme changed.
+2. **`#5003C0` is already bright, so panels cannot go lighter and stay distinct.** Lightening it barely moves
+   the ratio (a lighter violet only reaches ~1.2:1). The layers therefore go *darker*: page `#5003C0` →
+   panel `#3A0191` (2.30:1) → well `#2A0170` (1.93:1 from the panel, with a 1px light border for crispness).
+
+**Dark contrast checks** (computed, then re-verified against the rendered pages)
+
+Text — 4.5:1 normal / 3:1 large:
+
+| Pair | Ratio | | Pair | Ratio |
+| --- | --- | --- | --- | --- |
+| ink on page | 9.93:1 | | ink on panel | 13.18:1 |
+| ink on well | 15.71:1 | | muted on page | 5.91:1 |
+| muted on panel | 7.85:1 | | muted on well | 9.36:1 |
+| link `#D6BCFF` on page | 5.91:1 | | link on panel | 7.84:1 |
+| accent-as-text on page | 6.99:1 | | accent-as-text on panel | 9.28:1 |
+| white on primary `#AB03A9` | 6.33:1 | | white on primary hover | 4.95:1 |
+| dark text on `#FF467A` | 5.70:1 | | dark text on `#FFD51E` | 13.14:1 |
+| white on toast | 15.71:1 | | muted on disabled fill | 9.36:1 |
+| brand mark `#C9A8FF` on page | 4.98:1 (large text) | | ink on invalid wash | 14.74:1 |
+
+UI components / boundaries — 3:1:
+
+| Pair | Ratio | Verdict |
+| --- | --- | --- |
+| primary edge `#C7B2FF` on page / panel | 5.31 / 7.06:1 | passes |
+| control border on well | 8.41:1 | passes |
+| focus accent on page | 6.99:1 | passes |
+| focus white edge on page / pill / magenta | 9.93 / 3.28 / 6.33:1 | passes |
+| invalid border `#FF467A` on the wash | 4.50:1 | passes |
+| yellow badge vs page | 6.99:1 | passes |
+| `#AB03A9` fill alone on page | 1.57:1 | **fails alone** → carried by `--edge-primary` (5.31:1) |
+| `#FF467A` fill alone on page | 3.03:1 | passes, and its own border is a stronger 5.31:1 |
+| white text on `#FFD51E` / on `#FF467A` | 1.42 / 3.28:1 | **never used** — those fills take `--on-bright` |
+| focus yellow band on a pink button | 2.31:1 | fails alone → the white outer edge (3.28:1) carries the ring |
+
+**Dark-only rule change:** the native checkbox (`appearance: auto`) paints a neutral grey box that reads muddy
+olive against the purple, and it ignores `background`/`border`. Dark therefore draws its own checkbox
+(`appearance: none`, well fill, light border, white check on the magenta fill). Light keeps the native control,
+so the only light-mode change in Part 2 is the checkbox `accent-color`, which moved from `#0081C9` to the
+primary fill `#0074B4` so the white checkmark works in both themes (white-check contrast improves 4.21 → 5.05).
+
+**Part 2 verification**
+
+- **Switch behaviour**: on all four pages — default `data-theme="dark"` with `color-scheme: dark`, clicking it
+  switches to `data-theme="light"` / `color-scheme: light`, `aria-checked` and `.is-on` follow, the choice is
+  stored and survives a reload, and a second click returns to dark.
+- **Rendered and inspected**: dark screenshots of all four pages plus the state set (error, loading, disabled,
+  focus on button and field, attachments, hover, invalid field, mobile) and light regression shots, at
+  1440×900 and 390×844.
+- **Palette audit**: 49/49 dark assertions on computed styles — the four given values land in their roles
+  (`--bg` `#5003C0`, primary `#AB03A9`, highlight `#FF467A`, accent `#FFD51E`), every derived token resolves as
+  planned, and the light theme still resolves to its Part 1 values (`#0081C9` / `#5BC0F8` / `#86E5FF` /
+  `#FFC93C`, page `#F2FAFE`, focus ring unchanged) — light regression audit 38/38.
+- **Layout sweep** re-run in dark: no horizontal overflow at 360 / 390 / 768 / 1024 / 1440 / 1920 px.
+- **Existing tests**: `test_settings.py`, `test_material.py`, `test_txt.py` still pass.
+
+**Part 2 notes**
+
+- The switch adds visible UI to every page and a new file (`static/theme.js`) — both were explicitly requested,
+  and they are the only additions beyond styling.
+- Panels sit *darker* than the page in dark mode, the inverse of the light theme. That is forced by the maths
+  above, not a preference.
+- `#FF467A` and `#FFD51E` are bright surfaces: they always carry `--on-bright` text, never white.
+

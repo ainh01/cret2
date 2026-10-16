@@ -1,12 +1,17 @@
 
 <!doctype html>
-<html>
+<html data-theme="dark">
 <head>
   <meta charset="utf-8">
   <title>Quiz Parser and Randomizer</title>
   <link rel="stylesheet" href="static/style.css">
+  <script src="static/theme.js"></script>
 </head>
 <body>
+  <div class="theme-bar">
+    <button class="theme-toggle" id="themeToggle" type="button" role="switch" aria-checked="true">Chế độ tối</button>
+  </div>
+
   <div>
     <button id="pasteButton" type="button">Paste</button>
     <button id="parseButton" type="button">Parse and Random</button>

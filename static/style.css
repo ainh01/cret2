@@ -54,13 +54,126 @@
   --focus-edge: var(--ink);
   --focus-ring: 0 0 0 2px var(--focus-accent), 0 0 0 4px var(--focus-edge);
 
-  /* 5 — legacy token names, mapped to the new system
+  /* 5 — theme-crossing roles (a value each theme answers differently) */
+  --on-bright: var(--ink);         /* text on --brand-soft / --accent fills */
+  --link-hover: var(--brand-deep); /* link text on hover */
+  --edge-primary: transparent;     /* edge that identifies a primary fill */
+  --inverse-surface: var(--ink);   /* toasts: lifted off the page */
+  --inverse-text: #FFFFFF;
+  --shadow: rgba(13, 36, 48, .2);
+
+  /* 6 — legacy token names, mapped to the new system
         (--line and --muted keep their names; values replaced above) */
   --green: var(--brand-strong); /* legacy name (old green) → primary brand */
 
+  color-scheme: light;
   font-family: Inter, "Segoe UI", sans-serif;
   color: var(--ink);
   background: var(--bg);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   DARK THEME — the default (set as data-theme="dark" in the markup).
+   Same token names and the same roles, re-answered for a dark surface.
+   Palette: #5003C0 base surface · #AB03A9 primary · #FF467A highlight ·
+            #FFD51E accent, plus darker/lighter shades of the same hues.
+
+   Why two derived values exist:
+     · #5003C0 (L 0.106) and #AB03A9 (L 0.116) are almost the same
+       luminance, so a magenta primary button is invisible against the page
+       without an edge  →  --edge-primary #C7B2FF (5.31:1 on the page).
+     · #5003C0 is already bright, so panels cannot go lighter and stay
+       distinct  →  panels sit darker at #3A0191 and wells darker still at
+       #2A0170 (the "more dark" the surfaces need).
+
+   Contrast anchors (full table in PALETTE-REPORT.md):
+     ink on page 9.93:1 · ink on panel 13.18:1 · ink on well 15.71:1
+     muted on page 5.91:1 · links 5.91:1 · accent as text 6.99:1
+     white on primary 6.33:1 · dark text on highlight 5.70:1 · on accent 13.14:1
+   ═══════════════════════════════════════════════════════════════════════ */
+:root[data-theme="dark"] {
+  /* surfaces — the given purple is the page, deeper shades carry the layers */
+  --brand: #C9A8FF;      /* brand hue lightened so it reads on dark (4.98:1) */
+  --brand-pale: #3A0191; /* panels, banners, stripes, disabled fills */
+  --bg: #5003C0;         /* the palette's base surface (exact value) */
+  --surface: #2A0170;    /* field/code wells */
+  --surface-soft: #3A0191;
+
+  /* text */
+  --ink: #FFFFFF;
+  --muted: #CFC0F5;
+  --text: var(--ink);
+  --text-muted: var(--muted);
+
+  /* lines */
+  --line: #7B45E0;
+  --line-strong: #C7B2FF;
+
+  /* the given hues in their dark-theme roles */
+  --brand-soft: #FF467A;      /* highlight fills — carries dark text */
+  --brand-soft-deep: #FF6B95; /* pressed/hover highlight */
+  --accent: #FFD51E;          /* accent/attention fills */
+  --accent-ink: #FFD51E;      /* accent as text/border (6.99:1 on the page) */
+  --accent-wash: #4A0F3C;     /* invalid field tint */
+
+  /* derived shades of the primary/highlight hues */
+  --brand-strong: #D6BCFF;    /* links + brand text (5.91:1 on the page) */
+  --brand-deep: #C704C4;      /* primary hover fill (white 4.95:1) */
+  --fill-primary: #AB03A9;
+  --fill-primary-hover: var(--brand-deep);
+  --fill-secondary: var(--brand-soft);
+  --fill-secondary-hover: var(--brand-soft-deep);
+  --fill-info: var(--brand-pale);
+  --fill-warning: var(--accent);
+  --fill-disabled: #2A0170;
+
+  /* theme-crossing roles */
+  --on-bright: #2A0413;       /* text on highlight/accent fills */
+  --link-hover: #FFFFFF;
+  --edge-primary: #C7B2FF;    /* identifies a primary fill on the purple page */
+  --inverse-surface: #2A0170;
+  --inverse-text: #FFFFFF;
+  --shadow: rgba(0, 0, 0, .5);
+
+  /* focus: yellow reads on the page, the white edge covers pink buttons */
+  --focus-accent: var(--accent);
+  --focus-edge: #FFFFFF;
+  --focus-ring: 0 0 0 2px var(--focus-accent), 0 0 0 4px var(--focus-edge);
+
+  --green: var(--brand-strong);
+
+  color-scheme: dark;
+}
+
+/* Dark-only control rendering: the native checkbox paints a neutral grey that
+   reads muddy on the purple, so dark draws its own box. Light keeps the
+   native control exactly as before. */
+:root[data-theme="dark"] input[type="checkbox"] {
+  appearance: none;
+  display: inline-grid;
+  place-content: center;
+  background: var(--surface);
+  border: 1px solid var(--line-strong);
+  border-radius: .25rem;
+}
+:root[data-theme="dark"] input[type="checkbox"]::before {
+  content: "";
+  width: .58rem;
+  height: .58rem;
+  background: #FFFFFF; /* white check on the magenta fill: 6.33:1 */
+  transform: scale(0);
+  transition: transform .12s ease-out;
+  clip-path: polygon(14% 44%, 0 58%, 42% 100%, 100% 18%, 84% 4%, 41% 70%);
+}
+:root[data-theme="dark"] input[type="checkbox"]:checked {
+  background: var(--fill-primary);
+  border-color: var(--edge-primary);
+}
+:root[data-theme="dark"] input[type="checkbox"]:checked::before { transform: scale(1); }
+:root[data-theme="dark"] input[type="checkbox"]:active { background: var(--brand-deep); }
+:root[data-theme="dark"] input[type="checkbox"]:disabled {
+  background: var(--fill-disabled);
+  border-color: var(--line);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
@@ -86,7 +199,7 @@ h1 { font-size: 1.5rem; margin: 0 0 20px; }
 h1 span { color: var(--brand); } /* 24px display text: 4.21:1 ≥ 3:1 large-text AA */
 
 a { color: var(--brand-strong); } /* 5.05:1 on white */
-a:hover { color: var(--brand-deep); }
+a:hover { color: var(--link-hover); }
 
 ::placeholder { color: var(--muted); opacity: 1; } /* 7.52:1 on white */
 
@@ -117,7 +230,7 @@ input, select, textarea {
 input[type="checkbox"] {
   width: 1.15rem;
   height: 1.15rem;
-  accent-color: var(--brand); /* checked fill 4.21:1 ≥ 3:1 UI */
+  accent-color: var(--fill-primary); /* checked fill takes the primary, white check */
   border-radius: .25rem;
   cursor: pointer;
 }
@@ -179,6 +292,45 @@ button.loading { cursor: progress; }
 button.loading .spinner { display: inline-block; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
+/* ── theme switch (every page, top of the content column) ─────────
+   A switch, not a label swap: the text stays "Chế độ tối" and
+   aria-checked / .is-on report whether dark is on. Dark is the default. */
+.theme-bar {
+  display: flex;
+  justify-content: flex-end;
+  margin: 0 0 .7rem;
+}
+.theme-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: .45rem;
+  padding: .45rem .9rem;
+  font-size: .78rem;
+  font-weight: 600;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--muted);
+}
+.theme-toggle::before { /* state dot */
+  content: "";
+  width: .5rem;
+  height: .5rem;
+  border-radius: 50%;
+  background: var(--muted);
+  flex: none;
+}
+.theme-toggle:hover:not(:disabled) {
+  background: var(--surface-soft);
+  border-color: var(--brand);
+  color: var(--ink);
+}
+.theme-toggle.is-on {
+  background: var(--brand-pale);
+  color: var(--ink);
+}
+.theme-toggle.is-on::before { background: var(--accent); }
+
 /* ═══════════════════════════════════════════════════════════════════════
    PAGE — home.html
    ═══════════════════════════════════════════════════════════════════════ */
@@ -206,7 +358,7 @@ button.loading .spinner { display: inline-block; }
   letter-spacing: 0.02em;
   color: #fff;
   background: var(--fill-primary);
-  border: 0;
+  border: 1px solid var(--edge-primary);
   display: inline-flex;
   align-items: center;
   gap: 10px;
@@ -230,13 +382,13 @@ button.loading .spinner { display: inline-block; }
   padding: 8px 18px;
   font-size: 0.95rem;
   font-weight: 500;
-  color: var(--text);
+  color: var(--on-bright);
   background: var(--fill-secondary);
   border: 1px solid var(--line-strong);
 }
 #addFiles.secondary:hover:not(:disabled) {
   background: var(--fill-secondary-hover);
-  border-color: var(--brand-deep);
+  border-color: var(--brand);
 }
 #addFiles.secondary:active:not(:disabled) { background: var(--brand-soft-deep); }
 
@@ -266,7 +418,7 @@ li.attachment .tag {
   border-radius: 999px;
   font-size: 0.75rem;
   background: var(--accent); /* badges → accent */
-  color: var(--ink);         /* 10.42:1 */
+  color: var(--on-bright);   /* 10.4:1 light / 13.1:1 dark */
   border: 1px solid var(--accent-ink);
 }
 li.attachment .name {
@@ -290,7 +442,7 @@ li.attachment .remove {
 }
 li.attachment .remove:hover:not(:disabled) {
   background: var(--accent);
-  color: var(--ink); /* 10.42:1 */
+  color: var(--on-bright); /* 10.4:1 light / 13.1:1 dark */
 }
 
 #status {
@@ -313,6 +465,7 @@ li.attachment .remove:hover:not(:disabled) {
 }
 #error:not(:empty) { /* error state → attention banner */
   background: var(--fill-warning);
+  color: var(--on-bright);
   padding: 10px 14px;
   border-radius: 10px;
   border-left: 4px solid var(--accent-ink);
@@ -332,7 +485,7 @@ li.attachment .remove:hover:not(:disabled) {
   font-weight: 600;
   word-break: break-all;
 }
-#link a:hover { color: var(--brand-deep); }
+#link a:hover { color: var(--link-hover); }
 
 /* ═══════════════════════════════════════════════════════════════════════
    PAGE — settings.html
@@ -361,7 +514,7 @@ label { display: block; font-weight: 600; margin: 18px 0 6px; }
   font-weight: 600;
   color: #fff;
   background: var(--fill-primary);
-  border: 0;
+  border: 1px solid var(--edge-primary);
 }
 #save:hover:not(:disabled) { background: var(--fill-primary-hover); }
 #save:active:not(:disabled) { background: var(--brand-deep); }
@@ -381,7 +534,7 @@ label { display: block; font-weight: 600; margin: 18px 0 6px; }
 }
 #message.fail:not(:empty) {
   background: var(--fill-warning);
-  color: var(--ink);
+  color: var(--on-bright);
   padding: 10px 14px;
   border-radius: 10px;
   border-left: 4px solid var(--accent-ink);
@@ -480,12 +633,13 @@ body > textarea {
   padding: 10px 22px;
   font-size: 0.95rem;
   font-weight: 500;
+  color: var(--on-bright);
   background: var(--fill-secondary);
   border: 1px solid var(--line-strong);
 }
 #pasteButton:hover:not(:disabled), #copyButton:hover:not(:disabled) {
   background: var(--fill-secondary-hover);
-  border-color: var(--brand-deep);
+  border-color: var(--brand);
 }
 #pasteButton:active:not(:disabled), #copyButton:active:not(:disabled) {
   background: var(--brand-soft-deep);
@@ -496,7 +650,7 @@ body > textarea {
   font-size: 0.95rem;
   color: #fff;
   background: var(--fill-primary);
-  border: 0;
+  border: 1px solid var(--edge-primary);
 }
 #parseButton:hover:not(:disabled) { background: var(--fill-primary-hover); }
 #parseButton:active:not(:disabled) { background: var(--brand-deep); }
@@ -638,7 +792,7 @@ body > div label {
   border: 1px solid var(--accent-ink);
   border-radius: .3rem;
   padding: .35rem .5rem;
-  color: var(--ink);
+  color: var(--on-bright);
 }
 .studio #followup { height: 5.8rem; font-size: .8rem; }
 .studio #follow {
@@ -657,7 +811,7 @@ body > div label {
   align-items: center;
   gap: .5rem;
 }
-.studio .status-dot { width: .4rem; height: .4rem; background: var(--brand); border-radius: 50%; }
+.studio .status-dot { width: .4rem; height: .4rem; background: var(--brand-strong); border-radius: 50%; }
 
 .studio .workspace {
   min-width: 0;
@@ -693,14 +847,16 @@ body > div label {
 .studio .tabs button { border-color: transparent; }
 .studio .tabs .selected {
   background: var(--brand-soft); /* selected item → highlight */
+  color: var(--on-bright);
   border-color: var(--line-strong);
 }
 .studio .accent {
-  color: var(--ink);
+  color: var(--on-bright);
   background: var(--accent);
   border-color: var(--accent-ink);
 }
-.studio .accent:hover:not(:disabled) { background: var(--accent-ink); color: #fff; }
+/* presses into the brand so the label stays white in both themes */
+.studio .accent:hover:not(:disabled) { background: var(--brand-deep); color: #fff; }
 .studio .separator { height: 1.2rem; width: 1px; background: var(--line); margin: 0 .3rem; }
 
 .studio .search-row {
@@ -791,10 +947,10 @@ body > div label {
 .studio #output a { color: var(--brand-strong); }
 .studio #output.raw { white-space: pre-wrap; font-family: Consolas, monospace; font-size: .9rem; }
 
-.studio mark { background: var(--accent); color: var(--ink); } /* 10.42:1 */
+.studio mark { background: var(--accent); color: var(--on-bright); } /* 10.4:1 light / 13.1:1 dark */
 .studio mark.current {
   background: var(--brand-soft);
-  color: var(--ink);
+  color: var(--on-bright);
   outline: 2px solid var(--ink);
 }
 
@@ -809,11 +965,11 @@ body > div label {
   color: var(--muted);
 }
 .studio .output-footer label { display: flex; align-items: center; gap: .4rem; white-space: nowrap; }
-.studio .output-footer input { width: auto; accent-color: var(--brand); }
+.studio .output-footer input { width: auto; accent-color: var(--fill-primary); }
 
 .studio #error:not(:empty) {
   background: var(--fill-warning);
-  color: var(--ink);
+  color: var(--on-bright);
   padding: .9rem 1.5rem;
   font-size: .8rem;
   border: 0;
@@ -826,9 +982,9 @@ body > div label {
   left: 50%;
   transform: translateX(-50%);
   padding: .8rem 1.4rem;
-  background: var(--ink);
-  color: #fff;
-  box-shadow: 0 4px 20px rgba(13, 36, 48, .2);
+  background: var(--inverse-surface);
+  color: var(--inverse-text);
+  box-shadow: 0 4px 20px var(--shadow);
   border-left: 4px solid var(--accent);
   border-radius: .5rem;
   font-size: .85rem;
