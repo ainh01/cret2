@@ -30,7 +30,7 @@ class IllustrationTests(unittest.IsolatedAsyncioTestCase):
                 return '```material\n' + MATERIAL + 'endmaterial```'
             if prompt.startswith('Generate'):
                 return '```quiz\n' + json.dumps(quiz) + '\nendquiz```'
-            return json.dumps({'section': 0, 'prompt': 'A detailed diagram of a cell', 'alt': 'Sơ đồ tế bào'})
+            return json.dumps([{'section': 0, 'prompt': 'A detailed diagram of a cell', 'alt': 'Sơ đồ tế bào'}])
 
         async def fake_share(config, state):
             shared.append(state)
@@ -72,6 +72,55 @@ class IllustrationTests(unittest.IsolatedAsyncioTestCase):
                         self.assertEqual((await client.get('/generated-images/../../secret')).status_code, 404)
                         self.assertEqual(len(calls), 3)
                         self.assertIn('factual accuracy', calls[2])
+
+    async def test_multiple_images_and_failure_cleanup(self):
+        material = ('# Giới thiệu\n\nĐây là nội dung đầu tiên về tế bào và cấu trúc.\n\n'
+                    '## Phần hai\n\nĐây là nội dung thứ hai về chức năng của tế bào.\n\n'
+                    '## Phần ba\n\nĐây là nội dung thứ ba về sự phát triển của tế bào.\n')
+        plans = [
+            {'section': 2, 'prompt': 'growth', 'alt': 'Phát triển'},
+            {'section': 0, 'prompt': 'structure', 'alt': 'Cấu trúc'},
+            {'section': 1, 'prompt': 'function', 'alt': 'Chức năng'},
+        ]
+        calls = []
+        async def fake_ai(prompt):
+            self.assertIn('up to 8 distinct illustrations', prompt)
+            self.assertIn('heading: Phần hai', prompt)
+            return json.dumps(plans)
+        async def fake_generate(prompt):
+            calls.append(prompt)
+            return PNG, 'png'
+        with tempfile.TemporaryDirectory() as tmp, patch.object(app, 'IMAGE_DIR', Path(tmp)), \
+             patch.object(app, 'ai_call', fake_ai), patch.object(app, 'generated_image_bytes', fake_generate):
+            result = await app.add_illustration(material, 'https://cret.example')
+            self.assertEqual(len(calls), 3)
+            self.assertEqual(result.count('!['), 3)
+            self.assertEqual(len(list(Path(tmp).iterdir())), 3)
+            self.assertLess(result.index('Cấu trúc]'), result.index('## Phần hai'))
+            self.assertLess(result.index('Chức năng]'), result.index('## Phần ba'))
+            self.assertGreater(result.index('Phát triển]'), result.index('## Phần ba'))
+
+        async def failing_generate(prompt):
+            if prompt == 'function':
+                raise app.PipelineError('provider error')
+            return PNG, 'png'
+        with tempfile.TemporaryDirectory() as tmp, patch.object(app, 'IMAGE_DIR', Path(tmp)), \
+             patch.object(app, 'ai_call', fake_ai), patch.object(app, 'generated_image_bytes', failing_generate):
+            with self.assertRaises(app.PipelineError):
+                await app.add_illustration(material, 'https://cret.example')
+            self.assertEqual(list(Path(tmp).iterdir()), [])
+
+    async def test_reject_invalid_illustration_plans(self):
+        material = 'Đây là một đoạn kiến thức dài và có nội dung rõ ràng.\n'
+        invalid = [[], [{'section': 0, 'prompt': 'x', 'alt': 'a'}] * 2,
+                   [{'section': 5, 'prompt': 'x', 'alt': 'a'}],
+                   [{'section': 0, 'prompt': '', 'alt': 'a'}]]
+        for plan in invalid:
+            async def fake_ai(prompt):
+                return json.dumps(plan)
+            with self.subTest(plan=plan), patch.object(app, 'ai_call', fake_ai):
+                with self.assertRaises(app.PipelineError):
+                    await app.illustration_plan(material)
 
     async def test_image_url_download_and_private_address_rejection(self):
         async def provider(request):

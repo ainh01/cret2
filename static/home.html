@@ -43,13 +43,11 @@
   </div>
   <div class="settings-body">
     <label for="questionCount">Số câu hỏi</label>
-    <input id="questionCount" type="number" min="1" max="50" step="1" value="6" inputmode="numeric" aria-describedby="questionCountHint settingsStorageStatus">
-    <p class="settings-hint" id="questionCountHint">Từ 1 đến 50 câu. Cài đặt được lưu trên trình duyệt này.</p>
+    <input id="questionCount" type="number" min="1" max="50" step="1" value="6" inputmode="numeric" aria-describedby="settingsStorageStatus">
     <div class="toggle illustration-toggle">
       <input id="generateIllustration" type="checkbox">
       <label for="generateIllustration">Tạo ảnh minh họa AI</label>
     </div>
-    <p class="settings-hint">Tạo ảnh bổ sung sau học liệu và trắc nghiệm.</p>
     <p class="settings-hint" id="settingsStorageStatus" role="status"></p>
     <button class="settings-reset" id="resetSettings" type="button">Đặt lại cài đặt</button>
   </div>

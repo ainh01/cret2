@@ -925,65 +925,89 @@ def join_source(user_input, sources):
 # ---------------------------------------------------------------- optional illustration
 
 MAX_GENERATED_IMAGE_BYTES = 20 * 1024 * 1024
+MAX_ILLUSTRATIONS = 8
+ILLUSTRATION_CONCURRENCY = 3
 
 
 def illustration_sections(material):
-    """Pick prose paragraphs outside fenced code blocks, preserving their positions."""
+    """Collect prose paragraphs with their nearest heading, outside fenced code blocks."""
     sections = []
     offset = 0
-    fenced = False
+    fence_char = None
+    fence_length = 0
     previous_prose = False
+    heading = ''
     for line in material.splitlines(keepends=True):
         stripped = line.strip()
-        if re.match(r'^\s*(```|~~~)', line):
-            fenced = not fenced
+        fence = re.match(r'^ {0,3}(`{3,}|~{3,})', line)
+        if fence:
+            marker = fence.group(1)
+            if fence_char is None:
+                fence_char, fence_length = marker[0], len(marker)
+            elif marker[0] == fence_char and len(marker) >= fence_length:
+                fence_char = None
             previous_prose = False
-        elif (not fenced and len(stripped) >= 20 and not line.startswith(('    ', '\t'))
+        elif fence_char is None and re.match(r'^ {0,3}#{1,6}\s+\S', line):
+            heading = re.sub(r'^ {0,3}#{1,6}\s+', '', stripped).strip()
+            previous_prose = False
+        elif (fence_char is None and len(stripped) >= 20 and not line.startswith(('    ', '\t'))
               and not stripped.startswith(('#', '!', '<', '|', '```', '~~~', '>', '-', '*', '+'))):
             end = offset + len(line.rstrip('\r\n'))
             if sections and previous_prose:
-                sections[-1] = (end, sections[-1][1] + ' ' + stripped)
+                sections[-1] = (end, sections[-1][1] + ' ' + stripped, heading)
             else:
-                sections.append((end, stripped))
+                sections.append((end, stripped, heading))
             previous_prose = True
         else:
             previous_prose = False
         offset += len(line)
-    return sections[:60]
+    return sections
 
 
 async def illustration_plan(material):
     sections = illustration_sections(material)
     if not sections:
         raise PipelineError('Không tìm được đoạn học liệu phù hợp để minh họa.')
-    choices = '\n'.join(f'{index}: {text[:350]}' for index, (_, text) in enumerate(sections))
+    choices = '\n'.join(f'{index} [heading: {heading or "(none)"}]: {text[:350]}'
+                        for index, (_, text, heading) in enumerate(sections))
     prompt = (
-        'You are an expert educational visual designer. Study the material below and select one '
-        'paragraph that would benefit most from an accurate illustration. Create a precise image '
-        'prompt tied to its actual concepts, entities, relationships, quantities and context. '
+        'You are an expert educational visual designer. Read the learning material below and plan '
+        f'up to {MAX_ILLUSTRATIONS} distinct illustrations, ideally one per meaningful section. '
+        'For a multi-section lesson choose multiple distinct paragraphs spread across its sections; '
+        'for a short lesson choose fewer. Only illustrate where an image genuinely clarifies a concept. '
+        'Each illustration must have its own precise image prompt grounded in that paragraph and '
+        'the surrounding context, including actual concepts, entities, relationships and quantities. '
         'Use clear composition, factual accuracy, appropriate visual metaphors and meaningful '
         'labels only when essential; no decoration, unrelated details, watermarks or invented facts. '
         'Avoid illegible text and formulas; favor explanatory visual structure. Do not rewrite the material. '
-        'Return only valid JSON with keys "section" (integer from the numbered list), '
-        '"prompt" (detailed English visual instructions) and "alt" (brief Vietnamese description).\n\n'
+        'Return ONLY a JSON array of objects with keys "section" (distinct integer from the numbered '
+        'paragraphs), "prompt" (detailed English visual instructions) and "alt" (brief Vietnamese '
+        'description). Choose only sections from the list; do not duplicate a section.\n\n'
         'NUMBERED PARAGRAPHS:\n' + choices + '\n\nMATERIAL CONTEXT:\n' + material[:16000]
     )
     reply = (await ai_call(prompt)).strip()
     reply = re.sub(r'^```(?:json)?\s*|\s*```$', '', reply, flags=re.IGNORECASE)
     try:
-        plan = json.loads(reply)
-        index = plan['section']
-        description = plan['prompt']
-        alt = plan['alt']
-        if type(index) is not int or index < 0 or index >= len(sections):
-            raise ValueError('invalid section')
-        if not isinstance(description, str) or not description.strip() or len(description) > 5000:
-            raise ValueError('invalid prompt')
-        if not isinstance(alt, str) or not alt.strip() or len(alt) > 300:
-            raise ValueError('invalid alt text')
+        plans = json.loads(reply)
+        if not isinstance(plans, list) or not 1 <= len(plans) <= MAX_ILLUSTRATIONS:
+            raise ValueError('invalid illustration count')
+        result = []
+        seen = set()
+        for plan in plans:
+            index = plan['section']
+            description = plan['prompt']
+            alt = plan['alt']
+            if type(index) is not int or index < 0 or index >= len(sections) or index in seen:
+                raise ValueError('invalid or duplicate section')
+            if not isinstance(description, str) or not description.strip() or len(description) > 5000:
+                raise ValueError('invalid prompt')
+            if not isinstance(alt, str) or not alt.strip() or len(alt) > 300:
+                raise ValueError('invalid alt text')
+            seen.add(index)
+            result.append((sections[index][0], description.strip(), alt.strip()))
     except (ValueError, KeyError, TypeError):
-        raise PipelineError('Không tạo được mô tả ảnh minh họa hợp lệ. Vui lòng thử lại.')
-    return sections[index][0], description.strip(), alt.strip()
+        raise PipelineError('Không tạo được danh sách mô tả ảnh minh họa hợp lệ. Vui lòng thử lại.')
+    return sorted(result, key=lambda item: item[0])
 
 
 def image_extension(data):
@@ -1065,18 +1089,44 @@ async def add_illustration(material, public_base_url):
         pass
     if host in ('0.0.0.0', 'testserver') or host.endswith('.local'):
         raise PipelineError('Hãy mở Cret2 bằng địa chỉ công khai để người học tải được ảnh.')
-    position, prompt, alt = await illustration_plan(material)
-    data, extension = await generated_image_bytes(prompt)
-    filename = uuid.uuid4().hex + '.' + extension
+    plans = await illustration_plan(material)
+    semaphore = asyncio.Semaphore(ILLUSTRATION_CONCURRENCY)
+
+    async def generate_one(plan):
+        async with semaphore:
+            return await generated_image_bytes(plan[1])
+
+    # Wait for all calls to settle before reporting a failure; no files are written
+    # until every image is available, so a failed call cannot leave a partial set.
+    generated = await asyncio.gather(*(generate_one(plan) for plan in plans), return_exceptions=True)
+    for result in generated:
+        if isinstance(result, BaseException):
+            raise PipelineError('Không tạo đủ ảnh minh họa. Vui lòng thử lại.') from result
+
+    paths = []
+    insertions = []
     try:
         IMAGE_DIR.mkdir(parents=True, exist_ok=True)
-        with (IMAGE_DIR / filename).open('xb') as output:
-            output.write(data)
+        for (position, _, alt), (data, extension) in zip(plans, generated):
+            filename = uuid.uuid4().hex + '.' + extension
+            path = IMAGE_DIR / filename
+            with path.open('xb') as output:
+                paths.append(path)
+                output.write(data)
+            alt = re.sub(r'[\[\]\r\n\\]', ' ', alt).strip()
+            url = public_base_url.rstrip('/') + '/generated-images/' + filename
+            insertions.append((position, '\n\n![' + alt + '](' + url + ')\n'))
     except OSError as exc:
+        for path in paths:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
         raise PipelineError('Không lưu được ảnh minh họa trên server Cret2.') from exc
-    alt = re.sub(r'[\[\]\r\n\\]', ' ', alt).strip()
-    url = public_base_url.rstrip('/') + '/generated-images/' + filename
-    return material[:position] + '\n\n![' + alt + '](' + url + ')\n' + material[position:]
+    # Insert from the end so earlier offsets remain correct.
+    for position, markdown in reversed(insertions):
+        material = material[:position] + markdown + material[position:]
+    return material
 
 
 # ---------------------------------------------------------------- generation pipeline
