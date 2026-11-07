@@ -8,3 +8,9 @@ __pycache__
 test_*.py
 node_modules
 test-results
+data
+.agent-teams
+_case_*
+_ref_*
+vilao_cat.*
+test_*.js

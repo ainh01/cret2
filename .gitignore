@@ -16,6 +16,7 @@ node_modules/
 # Runtime artifacts
 mock.pid
 test-results/
+data/
 
 # IDE / OS
 .vscode/

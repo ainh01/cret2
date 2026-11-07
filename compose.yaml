@@ -1,0 +1,13 @@
+services:
+  cret2:
+    build: .
+    ports:
+      - "3004:3004"
+    env_file:
+      - .env
+    volumes:
+      - cret2-data:/app/data
+    restart: unless-stopped
+
+volumes:
+  cret2-data:

@@ -32,6 +32,17 @@
     <option value="High">Cao</option>
   </select>
 
+  <h2>Tạo ảnh minh họa</h2>
+  <label for="image_endpoint">Đường dẫn API ảnh</label>
+  <input id="image_endpoint" type="text" placeholder="https://api.example.com/v1">
+  <div class="hint">URL gốc hoặc đường dẫn đầy đủ /images/generations.</div>
+
+  <label for="image_api_key">Khóa API ảnh <span class="hint" id="imageKeyState"></span></label>
+  <input id="image_api_key" type="password" autocomplete="off">
+
+  <label for="image_model">Tên mô hình ảnh</label>
+  <input id="image_model" type="text" placeholder="tên-mô-hình-ảnh">
+
   <br>
   <button id="save" type="button">Lưu</button>
 
@@ -44,6 +55,10 @@
   const modelEl = document.getElementById('model');
   const effortEl = document.getElementById('thinking_effort');
   const keyStateEl = document.getElementById('keyState');
+  const imageEndpointEl = document.getElementById('image_endpoint');
+  const imageApiKeyEl = document.getElementById('image_api_key');
+  const imageModelEl = document.getElementById('image_model');
+  const imageKeyStateEl = document.getElementById('imageKeyState');
   const messageEl = document.getElementById('message');
   const saveBtn = document.getElementById('save');
 
@@ -61,6 +76,10 @@
       effortEl.value = data.thinking_effort || 'Off';
       keyStateEl.textContent = data.key_set ? 'đã có khóa' : 'chưa có khóa';
       apiKeyEl.placeholder = data.key_set ? 'đã có khóa' : '';
+      imageEndpointEl.value = data.image_endpoint || '';
+      imageModelEl.value = data.image_model || '';
+      imageKeyStateEl.textContent = data.image_key_set ? 'đã có khóa' : 'chưa có khóa';
+      imageApiKeyEl.placeholder = data.image_key_set ? 'đã có khóa' : '';
     } catch (e) {
       show('Không tải được cài đặt.', false);
     }
@@ -78,6 +97,9 @@
           api_key: apiKeyEl.value,
           model: modelEl.value,
           thinking_effort: effortEl.value,
+          image_endpoint: imageEndpointEl.value,
+          image_api_key: imageApiKeyEl.value,
+          image_model: imageModelEl.value,
         }),
       });
       const data = await response.json().catch(() => ({}));
@@ -86,6 +108,11 @@
         return;
       }
       apiKeyEl.value = '';
+      if (imageApiKeyEl.value.trim()) {
+        imageKeyStateEl.textContent = 'đã có khóa';
+        imageApiKeyEl.placeholder = 'đã có khóa';
+      }
+      imageApiKeyEl.value = '';
       keyStateEl.textContent = 'đã có khóa';
       apiKeyEl.placeholder = 'đã có khóa';
       show('Đã lưu.', true);

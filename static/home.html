@@ -9,7 +9,8 @@
 </head>
 <body>
 <main>
-  <div class="theme-bar">
+  <div class="theme-bar home-actions">
+    <button class="settings-open" id="openSettings" type="button" aria-haspopup="dialog" aria-controls="settingsDialog">Cài đặt</button>
     <button class="theme-toggle" id="themeToggle" type="button" role="switch" aria-checked="true">Chế độ tối</button>
   </div>
   <h1><span>Cret2</span> — liên kết học một chạm</h1>
@@ -22,7 +23,7 @@
   <input id="filePicker" type="file" multiple hidden
          accept=".pdf,.docx,.doc,.pptx,.ppt,.xlsx,.xls,.csv,.txt,.md,.html,.htm,.xml,.json,.epub,.ipynb,.wav,.mp3,.png,.jpg,.jpeg,.webp,.gif">
 
-  <input id="reference" type="text" autocomplete="off" spellcheck="false" placeholder="Link tham chiếu">
+  <input id="reference" type="text" autocomplete="off" spellcheck="false" placeholder="Link tham chiếu (vtask.fun)">
 
   <br>
   <button id="learn" type="button">
@@ -35,6 +36,25 @@
   <div id="link"></div>
 </main>
 
+<dialog class="settings-dialog" id="settingsDialog" aria-labelledby="settingsTitle">
+  <div class="settings-dialog-header">
+    <h2 id="settingsTitle">Cài đặt</h2>
+    <button class="settings-close" id="closeSettings" type="button" aria-label="Đóng cài đặt" autofocus>×</button>
+  </div>
+  <div class="settings-body">
+    <label for="questionCount">Số câu hỏi</label>
+    <input id="questionCount" type="number" min="1" max="50" step="1" value="6" inputmode="numeric" aria-describedby="questionCountHint settingsStorageStatus">
+    <p class="settings-hint" id="questionCountHint">Từ 1 đến 50 câu. Cài đặt được lưu trên trình duyệt này.</p>
+    <div class="toggle illustration-toggle">
+      <input id="generateIllustration" type="checkbox">
+      <label for="generateIllustration">Tạo ảnh minh họa AI</label>
+    </div>
+    <p class="settings-hint">Tạo ảnh bổ sung sau học liệu và trắc nghiệm.</p>
+    <p class="settings-hint" id="settingsStorageStatus" role="status"></p>
+    <button class="settings-reset" id="resetSettings" type="button">Đặt lại cài đặt</button>
+  </div>
+</dialog>
+
 <script src="/static/attachments.js"></script>
 <script>
   const inputEl = document.getElementById('input');
@@ -46,6 +66,71 @@
   const addFilesBtn = document.getElementById('addFiles');
   const filePicker = document.getElementById('filePicker');
   const attachmentsEl = document.getElementById('attachments');
+  const settingsDialog = document.getElementById('settingsDialog');
+  const questionCountEl = document.getElementById('questionCount');
+  const illustrationEl = document.getElementById('generateIllustration');
+  const ILLUSTRATION_KEY = 'cret2-generate-illustration';
+  const storageStatusEl = document.getElementById('settingsStorageStatus');
+  const QUESTION_COUNT_KEY = 'cret2-question-count';
+  const DEFAULT_QUESTION_COUNT = 6;
+  let questionCount = DEFAULT_QUESTION_COUNT;
+
+  function validQuestionCount(value) {
+    return /^\d+$/.test(String(value)) && Number(value) >= 1 && Number(value) <= 50;
+  }
+
+  try {
+    const savedCount = localStorage.getItem(QUESTION_COUNT_KEY);
+    if (savedCount !== null && validQuestionCount(savedCount)) questionCount = Number(savedCount);
+    illustrationEl.checked = localStorage.getItem(ILLUSTRATION_KEY) === 'true';
+  } catch (e) {
+    storageStatusEl.textContent = 'Không lưu được cài đặt trên trình duyệt này.';
+  }
+  questionCountEl.value = String(questionCount);
+
+  questionCountEl.addEventListener('input', () => {
+    if (!validQuestionCount(questionCountEl.value)) {
+      questionCountEl.setCustomValidity('Hãy nhập số nguyên từ 1 đến 50.');
+      return;
+    }
+    questionCountEl.setCustomValidity('');
+    questionCount = Number(questionCountEl.value);
+    try {
+      localStorage.setItem(QUESTION_COUNT_KEY, String(questionCount));
+      storageStatusEl.textContent = '';
+    } catch (e) {
+      storageStatusEl.textContent = 'Không lưu được cài đặt trên trình duyệt này.';
+    }
+  });
+  illustrationEl.addEventListener('change', () => {
+    try {
+      localStorage.setItem(ILLUSTRATION_KEY, String(illustrationEl.checked));
+      storageStatusEl.textContent = '';
+    } catch (e) {
+      storageStatusEl.textContent = 'Không lưu được cài đặt trên trình duyệt này.';
+    }
+  });
+  document.getElementById('resetSettings').addEventListener('click', () => {
+    questionCount = DEFAULT_QUESTION_COUNT;
+    illustrationEl.checked = false;
+    questionCountEl.value = String(questionCount);
+    questionCountEl.setCustomValidity('');
+    try {
+      localStorage.removeItem(QUESTION_COUNT_KEY);
+      localStorage.removeItem(ILLUSTRATION_KEY);
+      storageStatusEl.textContent = '';
+    } catch (e) {
+      storageStatusEl.textContent = 'Không lưu được cài đặt trên trình duyệt này.';
+    }
+  });
+
+  document.getElementById('openSettings').addEventListener('click', () => settingsDialog.showModal());
+  document.getElementById('closeSettings').addEventListener('click', () => settingsDialog.close());
+  settingsDialog.addEventListener('click', (event) => {
+    const bounds = settingsDialog.getBoundingClientRect();
+    if (event.clientX < bounds.left || event.clientX > bounds.right ||
+        event.clientY < bounds.top || event.clientY > bounds.bottom) settingsDialog.close();
+  });
 
   // Attachments live here only: adding or removing one never touches the network.
   const store = newAttachmentStore();
@@ -53,6 +138,7 @@
   const STAGES = {
     material: 'Đang viết học liệu...',
     quiz: 'Đang viết câu hỏi...',
+    illustration: 'Đang tạo ảnh minh họa...',
     interactive: 'Đang thêm phần tương tác...',
     share: 'Đang tạo liên kết...',
   };
@@ -189,16 +275,47 @@
   }
 
   learnBtn.addEventListener('click', async () => {
-    const typed = inputEl.value;
-    const plan = submissionPlan(store);
-    if (!typed.trim() && !plan.length) {
-      errorEl.textContent = 'Hãy nhập nội dung bạn muốn học.';
+    if (!validQuestionCount(questionCountEl.value)) {
+      settingsDialog.showModal();
+      questionCountEl.reportValidity();
+      questionCountEl.focus();
       return;
     }
+    const requestedQuestionCount = questionCount;
+    const requestedIllustration = illustrationEl.checked;
+    const typed = inputEl.value;
+    const plan = submissionPlan(store);
 
+    // Phải cứu link YouTube TRƯỚC, vì một link dán vào ô tham chiếu còn nằm
+    // trong ô đó chứ chưa vào `plan`: nếu kiểm tra rỗng trước thì ca "chỉ dán
+    // link, để trống ô nhập" sẽ bị chặn và không ra học liệu nào.
     const reference = parseReference(referenceEl.value);
     if (reference.error) {
-      errorEl.textContent = reference.error;
+      // Ô "Link tham chiếu" chỉ nhận link vtask.fun hoặc mã 6 ký tự. Một link
+      // YouTube dán nhầm vào đây không phải tham chiếu hỏng mà là học liệu:
+      // cứu nó thành tệp đính kèm rồi chạy tiếp, thay vì chặn tại chỗ.
+      const rescued = isYouTubeUrl(referenceEl.value);
+      if (!rescued) {
+        errorEl.textContent = reference.error;
+        return;
+      }
+      referenceEl.value = '';
+      // Đừng tạo chip thứ hai cho cùng một video: store có thể đã có sẵn chip
+      // YouTube với đúng link này (ví dụ người dùng dán link, xoá ô tham chiếu
+      // rồi dán lại). addAttachment() không tự chống trùng, nên phải chặn ở đây,
+      // kẻo cùng một video bị đọc hai lần và prompt bị đội lên gấp đôi.
+      const alreadyAdded = store.items.some(item => item.kind === 'youtube' && item.url === rescued);
+      if (!alreadyAdded) {
+        const rescuedItem = addItem({ kind: 'youtube', name: rescued, size: 0, url: rescued });
+        if (!rescuedItem) return;
+        plan.push(rescuedItem);
+      }
+    }
+
+    // Chỉ báo rỗng khi thật sự không có gì để học: không chữ, không tệp, và
+    // cũng không có link vừa được cứu ở trên.
+    if (!typed.trim() && !plan.length) {
+      errorEl.textContent = 'Hãy nhập nội dung bạn muốn học.';
       return;
     }
 
@@ -228,7 +345,8 @@
       }
 
       statusEl.textContent = 'Đang bắt đầu...';
-      const payload = { input: typed };
+      const payload = { input: typed, question_count: requestedQuestionCount, generate_illustration: requestedIllustration };
+      if (requestedIllustration) payload.browser_base_url = new URL('.', window.location.href).href.replace(/\/$/, '');
       if (reference.code) payload.reference = reference.code;
       if (sources.length) payload.sources = sources;
       if (images.length) payload.images = images;

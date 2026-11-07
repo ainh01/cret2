@@ -1,5 +1,8 @@
 import asyncio
+import base64
+import binascii
 import copy
+import ipaddress
 import json
 import os
 import random
@@ -9,13 +12,14 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import urlsplit
 
 import httpx
 from dotenv import load_dotenv, set_key
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -24,7 +28,10 @@ from pydantic import BaseModel, Field, field_validator
 from default_config import DEFAULT_CONFIG
 
 ROOT = Path(__file__).parent
+ENV_PATH = Path(os.getenv('SETTINGS_ENV_PATH', str(ROOT / '.env')))
 load_dotenv(ROOT / '.env')
+if ENV_PATH != ROOT / '.env':
+    load_dotenv(ENV_PATH, override=True)
 
 CONFIG_PATH = ROOT / 'configure.json'
 EFFORTS = {'off': 'Off', 'low': 'Low', 'medium': 'Medium', 'high': 'High'}
@@ -39,14 +46,25 @@ def normalize_endpoint(endpoint):
     return endpoint
 
 
+def normalize_image_endpoint(endpoint):
+    endpoint = (endpoint or '').strip().rstrip('/')
+    if endpoint and not endpoint.endswith('/images/generations'):
+        endpoint += '/images/generations'
+    return endpoint
+
+
 class GlobalSettings:
     def __init__(self):
         self.endpoint = normalize_endpoint(os.getenv('ENDPOINT', ''))
         self.token = os.getenv('TOKEN', '')
         self.model = os.getenv('MODEL', '')
         self.thinking_effort = EFFORTS.get(os.getenv('THINKING_EFFORT', 'off').strip().lower(), 'Off')
+        self.image_endpoint = normalize_image_endpoint(os.getenv('IMAGE_ENDPOINT', ''))
+        self.image_token = os.getenv('IMAGE_TOKEN', '')
+        self.image_model = os.getenv('IMAGE_MODEL', '')
 
-    def update(self, endpoint=None, token=None, model=None, thinking_effort=None):
+    def update(self, endpoint=None, token=None, model=None, thinking_effort=None,
+               image_endpoint=None, image_token=None, image_model=None):
         if endpoint is not None:
             self.endpoint = endpoint
         if token is not None:
@@ -55,6 +73,12 @@ class GlobalSettings:
             self.model = model
         if thinking_effort is not None:
             self.thinking_effort = thinking_effort
+        if image_endpoint is not None:
+            self.image_endpoint = image_endpoint
+        if image_token is not None:
+            self.image_token = image_token
+        if image_model is not None:
+            self.image_model = image_model
 
 
 settings = GlobalSettings()
@@ -112,6 +136,20 @@ async def configure_page():
 
 app.mount('/static', StaticFiles(directory=ROOT / 'static'))
 
+# Keep generated files outside the application image; mount a persistent volume in Docker.
+IMAGE_DIR = Path(os.getenv('IMAGE_DIR', str(ROOT / 'data' / 'images')))
+
+
+@app.get('/generated-images/{filename}')
+async def generated_image(filename: str):
+    if not re.fullmatch(r'[0-9a-f]{32}\.(?:png|jpg|webp)', filename):
+        raise HTTPException(404, 'Không tìm thấy ảnh.')
+    path = IMAGE_DIR / filename
+    if not path.is_file():
+        raise HTTPException(404, 'Không tìm thấy ảnh.')
+    return FileResponse(path, headers={'Cache-Control': 'public, max-age=31536000, immutable',
+                                       'Access-Control-Allow-Origin': '*'})
+
 
 # ---------------------------------------------------------------- settings (.env)
 
@@ -122,6 +160,9 @@ async def get_settings():
         'model': settings.model,
         'thinking_effort': settings.thinking_effort,
         'key_set': bool(settings.token),
+        'image_endpoint': settings.image_endpoint,
+        'image_model': settings.image_model,
+        'image_key_set': bool(settings.image_token),
     }
 
 
@@ -130,6 +171,25 @@ class SettingsRequest(BaseModel):
     api_key: str = Field(default='', max_length=10000)
     model: str = Field(default='', max_length=300)
     thinking_effort: str = Field(default='Off', max_length=20)
+    image_endpoint: str | None = Field(default=None, max_length=2000)
+    image_api_key: str | None = Field(default=None, max_length=10000)
+    image_model: str | None = Field(default=None, max_length=300)
+
+
+def validate_http_url(value):
+    try:
+        parts = urlsplit(value)
+        valid = parts.scheme in ('http', 'https') and parts.hostname and not parts.username and not parts.password and not parts.query and not parts.fragment
+        _ = parts.port
+        return bool(valid) and not any(char.isspace() for char in value)
+    except ValueError:
+        return False
+
+
+def validate_public_base_url(value):
+    if not validate_http_url(value) or any(char in value for char in '()<>\\'):
+        return False
+    return True
 
 
 @app.post('/api/settings')
@@ -151,21 +211,41 @@ async def save_settings(body: SettingsRequest):
     effort = EFFORTS.get(body.thinking_effort.strip().lower())
     if effort is None:
         raise HTTPException(400, 'Mức suy luận phải là Tắt, Thấp, Trung bình hoặc Cao.')
+    image_endpoint = settings.image_endpoint if body.image_endpoint is None else body.image_endpoint.strip().rstrip('/')
+    if image_endpoint and not validate_http_url(image_endpoint):
+        raise HTTPException(400, 'Hãy nhập endpoint tạo ảnh HTTP(S) hợp lệ.')
+    image_endpoint = normalize_image_endpoint(image_endpoint)
+    image_token = (body.image_api_key or '').strip() or settings.image_token
+    if image_token and any(ord(char) < 33 or ord(char) > 126 for char in image_token):
+        raise HTTPException(400, 'Hãy nhập khóa API ảnh hợp lệ, không chứa khoảng trắng.')
+    image_model = settings.image_model if body.image_model is None else body.image_model.strip()
     # Stage updates together, preserving the other environment settings.
-    target = ROOT / '.env'
-    staged = ROOT / '.env.settings.tmp'
+    target = Path(os.getenv('SETTINGS_ENV_PATH', str(ROOT / '.env')))
+    staged = target.with_name(target.name + '.settings.tmp')
     try:
+        target.parent.mkdir(parents=True, exist_ok=True)
         staged.write_text(target.read_text(encoding='utf-8') if target.exists() else '', encoding='utf-8')
-        set_key(str(staged), 'ENDPOINT', endpoint)
-        set_key(str(staged), 'TOKEN', token)
-        set_key(str(staged), 'MODEL', model)
-        set_key(str(staged), 'THINKING_EFFORT', effort)
+        # Common endpoint, model and key values need no quotes. Quote unusual
+        # values so both dotenv and Docker Compose still parse them safely.
+        def set_env_value(key, value):
+            quote_mode = 'never' if not value or re.fullmatch(r'[A-Za-z0-9_./:@%+?=,~\-]+', value) else 'always'
+            set_key(str(staged), key, value, quote_mode=quote_mode)
+
+        set_env_value('ENDPOINT', endpoint)
+        set_env_value('TOKEN', token)
+        set_env_value('MODEL', model)
+        set_env_value('THINKING_EFFORT', effort)
+        set_env_value('IMAGE_ENDPOINT', image_endpoint)
+        set_env_value('IMAGE_TOKEN', image_token)
+        set_env_value('IMAGE_MODEL', image_model)
         os.replace(staged, target)
     except OSError:
         raise HTTPException(500, 'Không lưu được cài đặt. Kiểm tra quyền ghi file môi trường.')
     finally:
         staged.unlink(missing_ok=True)
-    settings.update(endpoint=endpoint, token=token, model=model, thinking_effort=effort)
+    settings.update(endpoint=endpoint, token=token, model=model, thinking_effort=effort,
+                    image_endpoint=image_endpoint, image_token=image_token,
+                    image_model=image_model)
     return {'status': 'saved'}
 
 
@@ -251,6 +331,20 @@ async def save_configure(body: ConfigureRequest):
 MAX_CONVERT_UPLOAD_BYTES = 25 * 1024 * 1024
 MAX_CONVERT_TEXT_CHARS = 1_000_000
 INVALID_LINK_ERROR = 'Liên kết YouTube không hợp lệ.'
+EMPTY_VIDEO_ERROR = ('Không lấy được nội dung của video này. '
+                     'Video có thể không tồn tại, bị chặn hoặc không có phụ đề.')
+# MarkItDown trả về đúng khối footer này khi trang video không có dữ liệu thật
+# (link chết, video bị chặn): nó âm thầm fallback sang HtmlConverter. Khối này
+# giống hệt nhau ở mọi link hỏng nên nó không phải nội dung video.
+YOUTUBE_BOILERPLATE_MARKERS = (
+    'youtube.com/about',
+    '© 2026 Google LLC',
+    'Google LLC',
+)
+# Hai mục này là dấu hiệu DUY NHẤT cho biết MarkItDown lấy được nội dung thật
+# của video. Chỉ có title (trường hợp video thiếu phụ đề) là chưa đủ.
+YOUTUBE_CONTENT_MARKERS = ('### Transcript', '### Description')
+YOUTUBE_TITLE_MARKER = '# YouTube'
 YOUTUBE_ID = r'[A-Za-z0-9_-]{5,}'
 YOUTUBE_HOSTS = {'youtube.com', 'www.youtube.com', 'm.youtube.com', 'youtu.be', 'www.youtu.be', 'm.youtu.be'}
 # Exactly the link shapes the composer accepts: /watch?v=, youtu.be/, /shorts/ and /embed/
@@ -288,6 +382,25 @@ def convert_upload(path):
 def convert_link(url):
     """Convert one validated YouTube link to text. Blocking: call through asyncio.to_thread."""
     return markitdown_text(markitdown_reader().convert(url))
+
+
+def youtube_content_or_raise(text):
+    """Return video text when it carries real content, else raise HTTP 422.
+
+    MarkItDown gives no error for a dead/blocked video: it falls back to the
+    generic page footer (always identical, so it cannot be teaching material),
+    and it silently drops the transcript section when it cannot fetch one,
+    leaving only the title. Both shapes used to pass the empty-text check and
+    reach /api/generate, where the model then invented material about YouTube
+    itself. Only a real '### Transcript' or '### Description' section counts as
+    video content.
+    """
+    if any(marker in text for marker in YOUTUBE_BOILERPLATE_MARKERS):
+        raise HTTPException(422, EMPTY_VIDEO_ERROR)
+    if (YOUTUBE_TITLE_MARKER in text
+            and not any(marker in text for marker in YOUTUBE_CONTENT_MARKERS)):
+        raise HTTPException(422, EMPTY_VIDEO_ERROR)
+    return text
 
 
 def youtube_source(value):
@@ -343,6 +456,12 @@ async def convert_attachment(file: UploadFile | None = File(None), url: str | No
         except Exception as exc:
             print(f'[chuyển đổi] lỗi khi đọc liên kết YouTube: {exc.__class__.__name__}: {exc}', file=sys.stderr)
             raise HTTPException(422, 'Không chuyển được liên kết YouTube sang văn bản.')
+        # Chỉ áp cho nhánh YouTube: tệp tải lên không có hình dạng này.
+        # Ngoại lệ đã bị chặn bởi asyncio.to_thread ở trên nên ở đây chỉ còn
+        # lỗi chuyển ngữ nghĩa: text rỗng/chỉ có title (thiếu phụ đề) hoặc
+        # footer boilerplate của trang video chết.
+        if isinstance(text, str):
+            text = youtube_content_or_raise(text)
 
     if not isinstance(text, str) or not text.strip():
         raise HTTPException(422, 'Nội dung sau khi chuyển đổi rỗng.')
@@ -725,6 +844,9 @@ class ImagePart(BaseModel):
 class GenerateRequest(BaseModel):
     input: str | None = Field(default=None, max_length=MAX_INPUT_CHARS)
     reference: str | None = Field(default=None, max_length=2000)
+    question_count: int = Field(default=6, ge=1, le=50, strict=True)
+    generate_illustration: bool = False
+    browser_base_url: str | None = Field(default=None, max_length=2000)
     sources: list[SourcePart] = Field(default_factory=list)
     images: list[ImagePart] = Field(default_factory=list)
 
@@ -795,13 +917,172 @@ def join_source(user_input, sources):
     for source in sources:
         text = (source.get('text') or '').strip()
         if text:
-            chunks.append(text)
+            name = (source.get('name') or '').strip()
+            chunks.append(f'Nguồn: {name}\n\n{text}' if name else text)
     return '\n\n'.join(chunks)
+
+
+# ---------------------------------------------------------------- optional illustration
+
+MAX_GENERATED_IMAGE_BYTES = 20 * 1024 * 1024
+
+
+def illustration_sections(material):
+    """Pick prose paragraphs outside fenced code blocks, preserving their positions."""
+    sections = []
+    offset = 0
+    fenced = False
+    previous_prose = False
+    for line in material.splitlines(keepends=True):
+        stripped = line.strip()
+        if re.match(r'^\s*(```|~~~)', line):
+            fenced = not fenced
+            previous_prose = False
+        elif (not fenced and len(stripped) >= 20 and not line.startswith(('    ', '\t'))
+              and not stripped.startswith(('#', '!', '<', '|', '```', '~~~', '>', '-', '*', '+'))):
+            end = offset + len(line.rstrip('\r\n'))
+            if sections and previous_prose:
+                sections[-1] = (end, sections[-1][1] + ' ' + stripped)
+            else:
+                sections.append((end, stripped))
+            previous_prose = True
+        else:
+            previous_prose = False
+        offset += len(line)
+    return sections[:60]
+
+
+async def illustration_plan(material):
+    sections = illustration_sections(material)
+    if not sections:
+        raise PipelineError('Không tìm được đoạn học liệu phù hợp để minh họa.')
+    choices = '\n'.join(f'{index}: {text[:350]}' for index, (_, text) in enumerate(sections))
+    prompt = (
+        'You are an expert educational visual designer. Study the material below and select one '
+        'paragraph that would benefit most from an accurate illustration. Create a precise image '
+        'prompt tied to its actual concepts, entities, relationships, quantities and context. '
+        'Use clear composition, factual accuracy, appropriate visual metaphors and meaningful '
+        'labels only when essential; no decoration, unrelated details, watermarks or invented facts. '
+        'Avoid illegible text and formulas; favor explanatory visual structure. Do not rewrite the material. '
+        'Return only valid JSON with keys "section" (integer from the numbered list), '
+        '"prompt" (detailed English visual instructions) and "alt" (brief Vietnamese description).\n\n'
+        'NUMBERED PARAGRAPHS:\n' + choices + '\n\nMATERIAL CONTEXT:\n' + material[:16000]
+    )
+    reply = (await ai_call(prompt)).strip()
+    reply = re.sub(r'^```(?:json)?\s*|\s*```$', '', reply, flags=re.IGNORECASE)
+    try:
+        plan = json.loads(reply)
+        index = plan['section']
+        description = plan['prompt']
+        alt = plan['alt']
+        if type(index) is not int or index < 0 or index >= len(sections):
+            raise ValueError('invalid section')
+        if not isinstance(description, str) or not description.strip() or len(description) > 5000:
+            raise ValueError('invalid prompt')
+        if not isinstance(alt, str) or not alt.strip() or len(alt) > 300:
+            raise ValueError('invalid alt text')
+    except (ValueError, KeyError, TypeError):
+        raise PipelineError('Không tạo được mô tả ảnh minh họa hợp lệ. Vui lòng thử lại.')
+    return sections[index][0], description.strip(), alt.strip()
+
+
+def image_extension(data):
+    if data.startswith(b'\x89PNG\r\n\x1a\n'):
+        return 'png'
+    if data.startswith(b'\xff\xd8\xff'):
+        return 'jpg'
+    if data.startswith(b'RIFF') and data[8:12] == b'WEBP':
+        return 'webp'
+    raise PipelineError('API ảnh trả về định dạng ảnh không được hỗ trợ.')
+
+
+async def generated_image_bytes(prompt):
+    if not settings.image_endpoint or not settings.image_model:
+        raise PipelineError('Chưa cấu hình API tạo ảnh. Mở /settings để cài endpoint và model ảnh.')
+    headers = {'Authorization': f'Bearer {settings.image_token}'} if settings.image_token else {}
+    try:
+        async with api_client().stream('POST', settings.image_endpoint, headers=headers,
+                                       json={'model': settings.image_model, 'prompt': prompt}) as response:
+            response.raise_for_status()
+            chunks, size = [], 0
+            async for chunk in response.aiter_bytes():
+                size += len(chunk)
+                if size > MAX_GENERATED_IMAGE_BYTES * 4 // 3 + 65536:
+                    raise ValueError('image response too large')
+                chunks.append(chunk)
+            item = json.loads(b''.join(chunks))['data'][0]
+        if item.get('b64_json'):
+            encoded = item['b64_json']
+            if not isinstance(encoded, str) or len(encoded) > (MAX_GENERATED_IMAGE_BYTES * 4 // 3 + 8):
+                raise ValueError('image too large')
+            data = base64.b64decode(encoded, validate=True)
+        else:
+            url = item['url']
+            # Do not follow redirects or download private/loopback targets supplied by a provider.
+            from urllib.parse import urlsplit
+            import socket
+            parts = urlsplit(url)
+            if parts.scheme != 'https' or not parts.hostname or parts.username or parts.password:
+                raise ValueError('invalid image URL')
+            addresses = await asyncio.to_thread(socket.getaddrinfo, parts.hostname, parts.port or 443, type=socket.SOCK_STREAM)
+            if not addresses or any(not ipaddress.ip_address(info[4][0]).is_global for info in addresses):
+                raise ValueError('unsafe image URL')
+            from urllib.parse import urlunsplit
+            address = ipaddress.ip_address(addresses[0][4][0])
+            host = f'[{address}]' if address.version == 6 else str(address)
+            port = parts.port or 443
+            authority = host if port == 443 else f'{host}:{port}'
+            pinned_url = urlunsplit((parts.scheme, authority, parts.path, parts.query, ''))
+            original_host = parts.hostname if port == 443 else f'{parts.hostname}:{port}'
+            async with app.state.direct_client.stream('GET', pinned_url, headers={'Host': original_host},
+                                                      extensions={'sni_hostname': parts.hostname},
+                                                      follow_redirects=False) as image_response:
+                if image_response.status_code != 200:
+                    raise ValueError('image download failed')
+                chunks, size = [], 0
+                async for chunk in image_response.aiter_bytes():
+                    size += len(chunk)
+                    if size > MAX_GENERATED_IMAGE_BYTES:
+                        raise ValueError('image too large')
+                    chunks.append(chunk)
+                data = b''.join(chunks)
+        if not data or len(data) > MAX_GENERATED_IMAGE_BYTES:
+            raise ValueError('empty or oversized image')
+        return data, image_extension(data)
+    except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError, binascii.Error, OSError) as exc:
+        raise PipelineError('Không tạo hoặc tải được ảnh minh họa. Kiểm tra cấu hình API ảnh và thử lại.') from exc
+
+
+async def add_illustration(material, public_base_url):
+    if not validate_public_base_url(public_base_url):
+        raise PipelineError('Không xác định được URL Cret2 để tạo link ảnh.')
+    host = (urlsplit(public_base_url).hostname or '').lower()
+    try:
+        address = ipaddress.ip_address(host)
+        if not address.is_global and not address.is_loopback:
+            raise PipelineError('Hãy mở Cret2 bằng địa chỉ công khai để người học tải được ảnh.')
+    except ValueError:
+        pass
+    if host in ('0.0.0.0', 'testserver') or host.endswith('.local'):
+        raise PipelineError('Hãy mở Cret2 bằng địa chỉ công khai để người học tải được ảnh.')
+    position, prompt, alt = await illustration_plan(material)
+    data, extension = await generated_image_bytes(prompt)
+    filename = uuid.uuid4().hex + '.' + extension
+    try:
+        IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+        with (IMAGE_DIR / filename).open('xb') as output:
+            output.write(data)
+    except OSError as exc:
+        raise PipelineError('Không lưu được ảnh minh họa trên server Cret2.') from exc
+    alt = re.sub(r'[\[\]\r\n\\]', ' ', alt).strip()
+    url = public_base_url.rstrip('/') + '/generated-images/' + filename
+    return material[:position] + '\n\n![' + alt + '](' + url + ')\n' + material[position:]
 
 
 # ---------------------------------------------------------------- generation pipeline
 
-async def run_pipeline(queue, user_input, reference='', images=None):
+async def run_pipeline(queue, user_input, reference='', images=None, question_count=6,
+                       generate_illustration=False, public_base_url=''):
     cfg = load_config()
     user_input = user_input or ''
     images = list(images or [])
@@ -831,7 +1112,12 @@ async def run_pipeline(queue, user_input, reference='', images=None):
     questions = []
     if steps['quiz']['enabled']:
         await queue.put({'stage': 'quiz'})
-        quiz_prompt = steps['quiz']['template'] + '\n\n' + material_text
+        quiz_template = re.sub(r'\bGenerate\s+6\s+questions\b',
+                               f'Generate {question_count} questions', steps['quiz']['template'],
+                               flags=re.IGNORECASE)
+        quiz_prompt = (quiz_template + '\n\n' + material_text +
+                       f'\n\nIMPORTANT: Generate exactly {question_count} questions. '
+                       'This requirement overrides any other question count in the instructions.')
         quiz_images = images if image_step == 'quiz' else None
         reply = await ai_call(quiz_prompt, quiz_images)
         parsed = None
@@ -841,6 +1127,8 @@ async def run_pipeline(queue, user_input, reference='', images=None):
             try:
                 parsed = parse_possibly_broken_json(raw_quiz)
                 validate_quiz(parsed)
+                if len(parsed) != question_count:
+                    raise ValueError(f'Cần đúng {question_count} câu hỏi, nhưng nhận được {len(parsed)} câu.')
                 break
             except ValueError as exc:
                 print('[trắc nghiệm] nội dung khối trắc nghiệm thô như sau', file=sys.stderr)
@@ -859,6 +1147,10 @@ async def run_pipeline(queue, user_input, reference='', images=None):
         replacement = extracted if extracted is not None else reply
         if replacement.strip():
             material_text = replacement
+
+    if generate_illustration:
+        await queue.put({'stage': 'illustration'})
+        material_text = await add_illustration(material_text, public_base_url)
 
     await queue.put({'stage': 'share'})
     state = {
@@ -881,7 +1173,7 @@ async def validation_handler(request, exc):
 
 
 @app.post('/api/generate')
-async def generate(body: GenerateRequest | None = None):
+async def generate(request: Request, body: GenerateRequest | None = None):
     body = body or GenerateRequest()
     sources, images = validate_attachments(body)
     source_payload = [{'name': source.name, 'text': source.text} for source in sources]
@@ -891,10 +1183,12 @@ async def generate(body: GenerateRequest | None = None):
     if len(material_input) > MAX_INPUT_CHARS:
         raise HTTPException(422, 'Nội dung quá dài (giới hạn 1.000.000 ký tự).')
     queue = asyncio.Queue()
+    public_base_url = (body.browser_base_url or '').strip().rstrip('/') or str(request.base_url).rstrip('/')
 
     async def produce():
         try:
-            link = await run_pipeline(queue, material_input, body.reference or '', image_payload)
+            link = await run_pipeline(queue, material_input, body.reference or '', image_payload,
+                                      body.question_count, body.generate_illustration, public_base_url)
             await queue.put({'done': True, 'link': link})
         except PipelineError as exc:
             await queue.put({'error': str(exc)})

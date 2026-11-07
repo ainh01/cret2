@@ -30,11 +30,26 @@ with tempfile.TemporaryDirectory() as directory:
             assert saved['TOKEN'] == 'test-secret'
             assert saved['MODEL'] == 'test-model'
             assert saved['THINKING_EFFORT'] == 'Low'
+            raw = (root / '.env').read_text()
+            assert 'ENDPOINT=https://example.com/v1/chat/completions\n' in raw
+            assert 'TOKEN=test-secret\n' in raw
+            assert 'MODEL=test-model\n' in raw
+            assert 'THINKING_EFFORT=Low\n' in raw
+            # Values containing dotenv metacharacters must round-trip safely.
+            response = client.post('/api/settings', json={
+                'endpoint': 'https://example.com/v1', 'api_key': 'special#key',
+                'model': 'model with spaces', 'thinking_effort': 'Low',
+            })
+            assert response.status_code == 200
+            saved = dotenv_values(root / '.env')
+            assert saved['TOKEN'] == 'special#key'
+            assert saved['MODEL'] == 'model with spaces'
+            assert "TOKEN='special#key'" in (root / '.env').read_text()
             # A blank key keeps the stored secret; the endpoint still updates.
             assert client.post('/api/settings', json={
                 'endpoint': 'https://example.org/v1/chat/completions', 'api_key': '',
             }).status_code == 200
-            assert dotenv_values(root / '.env')['TOKEN'] == 'test-secret'
+            assert dotenv_values(root / '.env')['TOKEN'] == 'special#key'
             assert client.get('/api/settings').json()['endpoint'] == 'https://example.org/v1/chat/completions'
             # Rejected endpoints and efforts never touch the saved settings.
             for endpoint in ['file:///tmp/test', 'https://user:password@example.org', 'https://example.org/?key=value']:

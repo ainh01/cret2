@@ -1,0 +1,161 @@
+"""Offline tests for illustration generation and persistent public image URLs."""
+import base64
+import json
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+import httpx
+from fastapi.testclient import TestClient
+import app
+
+PNG = b'\x89PNG\r\n\x1a\n' + b'test image bytes'
+MATERIAL = '# Bài học\n\nĐây là đoạn kiến thức rất quan trọng về tế bào.\n\n```interactive\nSome code that should not be considered.\n```\n'
+
+
+class IllustrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_image_pipeline_and_public_route(self):
+        calls, shared, stages = [], [], []
+        cfg = {'quiz_frontend_base': 'https://example.org', 'quiz_backend_base': 'https://example.org',
+               'randomize': False, 'steps': {
+                   'material': {'enabled': True, 'template': 'MATERIAL'},
+                   'quiz': {'enabled': True, 'template': 'Generate 6 questions'},
+                   'interactive': {'enabled': False, 'template': ''}}}
+        quiz = [{'question': 'Q', 'options': [{'label': x, 'value': x} for x in 'ABCD'], 'correct': 'A'}]
+
+        async def fake_ai(prompt, images=None):
+            calls.append(prompt)
+            if prompt.startswith('MATERIAL'):
+                return '```material\n' + MATERIAL + 'endmaterial```'
+            if prompt.startswith('Generate'):
+                return '```quiz\n' + json.dumps(quiz) + '\nendquiz```'
+            return json.dumps({'section': 0, 'prompt': 'A detailed diagram of a cell', 'alt': 'Sơ đồ tế bào'})
+
+        async def fake_share(config, state):
+            shared.append(state)
+            return 'https://example.org/abcdef'
+
+        async def image_provider(request):
+            self.assertEqual(request.headers['authorization'], 'Bearer image-secret')
+            payload = json.loads(request.content)
+            self.assertEqual(payload['model'], 'image-model')
+            self.assertIn('cell', payload['prompt'])
+            return httpx.Response(200, json={'data': [{'b64_json': base64.b64encode(PNG).decode()}]})
+
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(app, 'IMAGE_DIR', Path(tmp)), \
+             patch.object(app, 'load_config', return_value=cfg), \
+             patch.object(app, 'ai_call', fake_ai), \
+             patch.object(app, 'share_state', fake_share), \
+             patch.object(app.settings, 'image_endpoint', 'https://images.example.com/v1/images/generations'), \
+             patch.object(app.settings, 'image_token', 'image-secret'), \
+             patch.object(app.settings, 'image_model', 'image-model'):
+            async with httpx.AsyncClient(transport=httpx.MockTransport(image_provider)) as image_client:
+                with patch.object(app, 'api_client', return_value=image_client):
+                    transport = httpx.ASGITransport(app=app.app)
+                    async with httpx.AsyncClient(transport=transport, base_url='https://internal.example') as client:
+                        response = await client.post('/api/generate', json={'input': 'topic', 'question_count': 1,
+                                                                          'generate_illustration': True,
+                                                                          'browser_base_url': 'https://cret.example.com/prefix'})
+                        events = [json.loads(line) for line in response.text.splitlines() if line]
+                        self.assertEqual([e['stage'] for e in events if 'stage' in e],
+                                         ['material', 'quiz', 'illustration', 'share'])
+                        self.assertTrue(events[-1]['done'])
+                        material = shared[-1]['material']
+                        self.assertIn('![Sơ đồ tế bào](https://cret.example.com/prefix/generated-images/', material)
+                        self.assertIn(MATERIAL.splitlines()[2], material)
+                        filename = list(Path(tmp).iterdir())[0].name
+                        image = await client.get('/generated-images/' + filename)
+                        self.assertEqual(image.content, PNG)
+                        self.assertEqual(image.headers['access-control-allow-origin'], '*')
+                        self.assertEqual((await client.get('/generated-images/../../secret')).status_code, 404)
+                        self.assertEqual(len(calls), 3)
+                        self.assertIn('factual accuracy', calls[2])
+
+    async def test_image_url_download_and_private_address_rejection(self):
+        async def provider(request):
+            if request.method == 'POST':
+                return httpx.Response(200, json={'data': [{'url': 'https://cdn.example.com/picture.jpg'}]})
+            self.assertEqual(request.url.host, '93.184.216.34')
+            self.assertEqual(request.headers['host'], 'cdn.example.com')
+            self.assertEqual(request.extensions['sni_hostname'], 'cdn.example.com')
+            return httpx.Response(200, content=PNG)
+
+        def dns(ip):
+            return [(2, 1, 6, '', (ip, 443))]
+
+        with patch.object(app.settings, 'image_endpoint', 'https://api.example.com/v1/images/generations'), \
+             patch.object(app.settings, 'image_token', 'secret'), \
+             patch.object(app.settings, 'image_model', 'image-model'):
+            async with httpx.AsyncClient(transport=httpx.MockTransport(provider)) as client:
+                with patch.object(app, 'api_client', return_value=client), \
+                     patch.object(app.app.state, 'direct_client', client, create=True):
+                    with patch('socket.getaddrinfo', return_value=dns('93.184.216.34')):
+                        data, extension = await app.generated_image_bytes('diagram')
+                        self.assertEqual((data, extension), (PNG, 'png'))
+                    with patch('socket.getaddrinfo', return_value=dns('127.0.0.1')):
+                        with self.assertRaises(app.PipelineError):
+                            await app.generated_image_bytes('diagram')
+
+    def test_settings_are_independent_and_secret(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(app, 'ROOT', Path(tmp)), \
+             patch.object(app, 'settings', app.GlobalSettings()):
+            client = TestClient(app.app)
+            payload = {'endpoint': 'https://text.example/v1', 'api_key': 'text-secret', 'model': 'text-model',
+                       'image_endpoint': 'https://images.example/v1', 'image_api_key': 'image-secret',
+                       'image_model': 'image-model'}
+            response = client.post('/api/settings', json=payload)
+            self.assertEqual(response.status_code, 200)
+            loaded = client.get('/api/settings').json()
+            self.assertEqual(loaded['image_endpoint'], 'https://images.example/v1/images/generations')
+            self.assertNotIn('public_base_url', loaded)
+            self.assertTrue(loaded['image_key_set'])
+            self.assertNotIn('image-secret', json.dumps(loaded))
+            self.assertNotIn('text-secret', json.dumps(loaded))
+            payload['image_api_key'] = ''
+            self.assertEqual(client.post('/api/settings', json=payload).status_code, 200)
+            self.assertEqual(app.settings.image_token, 'image-secret')
+            payload['image_endpoint'] = 'https://user:pass@example.com'
+            self.assertEqual(client.post('/api/settings', json=payload).status_code, 400)
+
+    async def test_detect_browser_url_and_fallback(self):
+        seen = []
+        async def capture(queue, user_input, reference, images, question_count, enabled, public_url):
+            seen.append(public_url)
+            return 'https://example.org/abcdef'
+        with patch.object(app, 'run_pipeline', capture):
+            transport = httpx.ASGITransport(app=app.app)
+            async with httpx.AsyncClient(transport=transport, base_url='http://internal:3004') as client:
+                await client.post('/api/generate', json={'input': 'x', 'generate_illustration': True,
+                                                         'browser_base_url': 'https://public.example/prefix'})
+                self.assertEqual(seen[-1], 'https://public.example/prefix')
+                await client.post('/api/generate', json={'input': 'x'})
+                self.assertEqual(seen[-1], 'http://internal:3004')
+
+    async def test_disabled_and_error_do_not_publish(self):
+        cfg = {'quiz_frontend_base': 'https://example.org', 'quiz_backend_base': 'https://example.org',
+               'randomize': False, 'steps': {
+                   'material': {'enabled': False, 'template': ''},
+                   'quiz': {'enabled': False, 'template': ''},
+                   'interactive': {'enabled': False, 'template': ''}}}
+        async def no_image(material, url):
+            raise app.PipelineError('Không tạo được ảnh')
+        async def share(config, state):
+            return 'https://example.org/abcdef'
+        with patch.object(app, 'load_config', return_value=cfg), patch.object(app, 'add_illustration', no_image), \
+             patch.object(app, 'share_state', share):
+            transport = httpx.ASGITransport(app=app.app)
+            async with httpx.AsyncClient(transport=transport, base_url='https://cret.example') as client:
+                disabled = await client.post('/api/generate', json={'input': 'topic'})
+                self.assertIn('"done": true', disabled.text)
+                enabled = await client.post('/api/api/generate', json={'input': 'topic', 'generate_illustration': True})
+                self.assertEqual(enabled.status_code, 404)
+                enabled = await client.post('/api/generate', json={'input': 'topic', 'generate_illustration': True})
+                self.assertIn('Không tạo được ảnh', enabled.text)
+                self.assertNotIn('"done": true', enabled.text)
+
+
+if __name__ == '__main__':
+    unittest.main()
