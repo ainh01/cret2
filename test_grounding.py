@@ -22,6 +22,14 @@ CONFIG = {'quiz_frontend_base': 'https://example.com', 'quiz_backend_base': 'htt
 SOURCE = '[Trang PDF 1]\nTHD+N = -95 dB (20 mW)\nSidetone function; no latency specified.'
 
 
+def material_review(text):
+    return app.REVIEW_MATERIAL_BEGIN + '\n' + text + '\n' + app.REVIEW_MATERIAL_END
+
+
+def quiz_review(questions):
+    return app.REVIEW_QUIZ_BEGIN + '\n' + json.dumps(questions, ensure_ascii=False) + '\n' + app.REVIEW_QUIZ_END
+
+
 class GroundingTests(unittest.IsolatedAsyncioTestCase):
     async def test_each_stage_gets_original_and_verified_output_is_shared(self):
         calls, saved = [], []
@@ -35,8 +43,10 @@ class GroundingTests(unittest.IsolatedAsyncioTestCase):
                 return '```material\nEnriched with 0 ms latency\nendmaterial```'
             if prompt.startswith('Generate'):
                 return '```quiz\n' + json.dumps([QUESTION]) + '\nendquiz```'
-            if prompt.startswith('STAGE: SOURCE REVIEW'):
-                return json.dumps({'material': 'Corrected: latency is not specified.', 'questions': [QUESTION]})
+            if prompt.startswith('STAGE: SOURCE REVIEW MATERIAL'):
+                return material_review('Corrected: latency is not specified.')
+            if prompt.startswith('STAGE: SOURCE REVIEW QUIZ'):
+                return quiz_review([QUESTION])
             self.fail('Unexpected prompt')
         async def fake_share(config, state):
             saved.append(state)
@@ -45,7 +55,7 @@ class GroundingTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(app, 'load_config', return_value=CONFIG), patch.object(app, 'ai_call', fake_ai), \
              patch.object(app, 'share_state', fake_share):
             await app.run_pipeline(queue, SOURCE, question_count=1)
-        self.assertEqual(len(calls), 5)
+        self.assertEqual(len(calls), 6)
         for prompt in calls:
             self.assertIn(SOURCE, prompt)
         self.assertIn('Draft with 0 ms', calls[2])
@@ -90,14 +100,51 @@ class GroundingTests(unittest.IsolatedAsyncioTestCase):
                 return '```material\nDraft\nendmaterial```'
             if prompt.startswith('Generate'):
                 return '```quiz\n' + json.dumps([QUESTION]) + '\nendquiz```'
-            return json.dumps({'material': 'Draft', 'questions': [QUESTION]})
+            if prompt.startswith('STAGE: SOURCE REVIEW MATERIAL'):
+                return material_review('Draft')
+            return quiz_review([QUESTION])
         async def share(config, state):
             return 'https://example.com/abcdef'
         with patch.object(app, 'load_config', return_value=CONFIG), patch.object(app, 'ai_call', fake_ai), \
              patch.object(app, 'share_state', share):
             await app.run_pipeline(asyncio.Queue(), '', images=image, question_count=1)
-        self.assertEqual(len(seen), 5)
+        self.assertEqual(len(seen), 6)
         self.assertTrue(all(item == image for item in seen))
+
+    async def test_long_markdown_never_needs_json_escaping(self):
+        lesson = '# Công thức\n\n$\\frac{a}{b}$\n\n```interactive\n<div>"A"</div>\n```\n' + ('Dòng dài.\n' * 2000)
+        async def fake_ai(prompt, images=None):
+            if prompt.startswith('STAGE: SOURCE REVIEW MATERIAL'):
+                return material_review(lesson)
+            return quiz_review([QUESTION])
+        with patch.object(app, 'ai_call', fake_ai):
+            reviewed, questions = await app.review_material_and_quiz(SOURCE, SCHEMA, lesson, [QUESTION], None)
+        self.assertEqual(reviewed, lesson.strip())
+        self.assertEqual(questions, [QUESTION])
+
+    async def test_review_retries_missing_marker_and_bad_quiz(self):
+        attempts = {'material': 0, 'quiz': 0}
+        async def fake_ai(prompt, images=None):
+            if prompt.startswith('STAGE: SOURCE REVIEW MATERIAL'):
+                attempts['material'] += 1
+                return 'truncated' if attempts['material'] == 1 else material_review('Đã sửa.')
+            attempts['quiz'] += 1
+            return quiz_review([]) if attempts['quiz'] == 1 else quiz_review([QUESTION])
+        with patch.object(app, 'ai_call', fake_ai):
+            material, questions = await app.review_material_and_quiz(SOURCE, SCHEMA, 'Bài', [QUESTION], None)
+        self.assertEqual((material, questions), ('Đã sửa.', [QUESTION]))
+        self.assertEqual(attempts, {'material': 2, 'quiz': 2})
+
+    async def test_quiz_json_repair_reused(self):
+        malformed = json.dumps([QUESTION], ensure_ascii=False).replace('"20 mW"}', '"20 mW",}')
+        async def fake_ai(prompt, images=None):
+            if prompt.startswith('STAGE: SOURCE REVIEW MATERIAL'):
+                return material_review('Đã sửa.')
+            return app.REVIEW_QUIZ_BEGIN + '\n' + malformed + '\n' + app.REVIEW_QUIZ_END
+        with patch.object(app, 'ai_call', fake_ai):
+            material, questions = await app.review_material_and_quiz(SOURCE, SCHEMA, 'Bài', [QUESTION], None)
+        self.assertEqual(material, 'Đã sửa.')
+        self.assertEqual(questions, [QUESTION])
 
     async def test_bad_review_question_count_does_not_publish(self):
         async def fake_ai(prompt, images=None):
@@ -107,10 +154,12 @@ class GroundingTests(unittest.IsolatedAsyncioTestCase):
                 return '```material\nDraft\nendmaterial```'
             if prompt.startswith('Generate'):
                 return '```quiz\n' + json.dumps([QUESTION]) + '\nendquiz```'
-            return json.dumps({'material': 'Draft', 'questions': []})
+            if prompt.startswith('STAGE: SOURCE REVIEW MATERIAL'):
+                return material_review('Draft')
+            return quiz_review([])
         with patch.object(app, 'load_config', return_value=CONFIG), patch.object(app, 'ai_call', fake_ai), \
              patch.object(app, 'share_state') as share:
-            with self.assertRaisesRegex(app.PipelineError, 'trắc nghiệm không hợp lệ'):
+            with self.assertRaisesRegex(app.PipelineError, 'Kiểm tra trắc nghiệm'):
                 await app.run_pipeline(asyncio.Queue(), SOURCE, question_count=1)
             share.assert_not_called()
 

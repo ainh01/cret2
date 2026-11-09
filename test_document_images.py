@@ -70,9 +70,10 @@ async def fake_ai(prompt, images=None):
         return '```material\n' + MATERIAL + '\nendmaterial```'
     if prompt.startswith('HỌC'):
         return '```material\n' + MATERIAL + '\n![bịa](http://evil.example/x.png)\n[Image #1]\nendmaterial```'
-    if prompt.startswith('STAGE: SOURCE REVIEW'):
-        return json.dumps({'material': MATERIAL + '\n![bịa](http://evil.example/x.png)\n[Image #1]',
-                           'questions': quiz})
+    if prompt.startswith('STAGE: SOURCE REVIEW MATERIAL'):
+        return app.REVIEW_MATERIAL_BEGIN + '\n' + MATERIAL + '\n![bịa](http://evil.example/x.png)\n[Image #1]\n' + app.REVIEW_MATERIAL_END
+    if prompt.startswith('STAGE: SOURCE REVIEW QUIZ'):
+        return app.REVIEW_QUIZ_BEGIN + '\n' + json.dumps(quiz) + '\n' + app.REVIEW_QUIZ_END
     if prompt.startswith('Generate'):
         return '```quiz\n' + json.dumps(quiz) + '\nendquiz```'
     if 'placement failed' in prompt:

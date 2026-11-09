@@ -40,8 +40,10 @@ class QuestionCountTests(unittest.TestCase):
 
         async def fake_ai(prompt, images=None):
             self.prompts.append(prompt)
-            if prompt.startswith('STAGE: SOURCE REVIEW'):
-                return json.dumps({'material': 'đề bài', 'questions': generated})
+            if prompt.startswith('STAGE: SOURCE REVIEW MATERIAL'):
+                return app.REVIEW_MATERIAL_BEGIN + '\nđề bài\n' + app.REVIEW_MATERIAL_END
+            if prompt.startswith('STAGE: SOURCE REVIEW QUIZ'):
+                return app.REVIEW_QUIZ_BEGIN + '\n' + json.dumps(generated) + '\n' + app.REVIEW_QUIZ_END
             data = self.responses.pop(0)
             generated[:] = [question(i) for i in range(data)]
             return '```quiz\n' + json.dumps(generated) + '\nendquiz```'
@@ -67,7 +69,8 @@ class QuestionCountTests(unittest.TestCase):
         self.assertTrue(events[-1]['done'])
         self.assertEqual(len(self.saved[-1]['questions']), 3)
         self.assertTrue(any('Generate 3 questions. Custom instructions.' in prompt for prompt in self.prompts))
-        self.assertNotIn('Generate 6 questions', self.prompts[-2])
+        quiz_prompt = next(prompt for prompt in reversed(self.prompts) if prompt.startswith('Generate'))
+        self.assertNotIn('Generate 6 questions', quiz_prompt)
 
     def test_wrong_count_is_retried_and_not_published(self):
         response, events = self.request({'input': 'đề bài', 'question_count': 2}, [1, 2])

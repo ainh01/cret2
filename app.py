@@ -685,8 +685,33 @@ def repair_json_like_text(text):
     return result.strip()
 
 
+def strip_json_trailing_commas(text):
+    """Remove dangling commas outside strings without touching quoted content."""
+    out = []
+    in_string = False
+    escaped = False
+    for index, ch in enumerate(text):
+        if in_string:
+            out.append(ch)
+            if escaped:
+                escaped = False
+            elif ch == '\\':
+                escaped = True
+            elif ch == '"':
+                in_string = False
+        elif ch == '"':
+            in_string = True
+            out.append(ch)
+        elif ch == ',' and find_next_non_space(text, index + 1) in (']', '}'):
+            continue
+        else:
+            out.append(ch)
+    return ''.join(out)
+
+
 def parse_possibly_broken_json(text):
-    attempts = [text, repair_json_like_text(text), repair_json_like_text(repair_json_like_text(text))]
+    attempts = [text, strip_json_trailing_commas(text), repair_json_like_text(text),
+                repair_json_like_text(repair_json_like_text(text))]
     last_error = None
     for attempt in attempts:
         try:
@@ -1897,33 +1922,90 @@ async def create_material(context, schema, images):
     return require_nonempty_text(extracted if extracted is not None else reply, 'Tạo học liệu')
 
 
+REVIEW_REPAIR_ATTEMPTS = 2
+REVIEW_MATERIAL_BEGIN = '<<<CRET2_REVIEWED_MATERIAL>>>'
+REVIEW_MATERIAL_END = '<<<END_CRET2_REVIEWED_MATERIAL>>>'
+REVIEW_QUIZ_BEGIN = '<<<CRET2_REVIEWED_QUIZ>>>'
+REVIEW_QUIZ_END = '<<<END_CRET2_REVIEWED_QUIZ>>>'
+
+
+def extract_review_section(reply, begin, end):
+    """A complete delimited section, with Markdown kept out of JSON strings."""
+    text = (reply or '').replace('\r\n', '\n').replace('\r', '\n')
+    match = re.search(r'(?m)^' + re.escape(begin) + r'[ \t]*\n', text)
+    if not match:
+        raise ValueError('thiếu dấu mở phần đã kiểm tra')
+    close = re.search(r'(?m)^' + re.escape(end) + r'[ \t]*$', text[match.end():])
+    if not close:
+        raise ValueError('thiếu dấu kết thúc phần đã kiểm tra')
+    value = text[match.end():match.end() + close.start()].strip()
+    if not value:
+        raise ValueError('phần đã kiểm tra rỗng')
+    return value
+
+
+async def review_response(prompt, images, parse, stage):
+    """Retry invalid formatting without ever publishing an unchecked fallback."""
+    reply = await ai_call(prompt, images)
+    for attempt in range(REVIEW_REPAIR_ATTEMPTS + 1):
+        try:
+            return parse(reply)
+        except (ValueError, TypeError) as exc:
+            if attempt == REVIEW_REPAIR_ATTEMPTS:
+                raise PipelineError(f'{stage}: không nhận được phản hồi đầy đủ và đúng định dạng sau '
+                                    'khi thử lại; chưa chia sẻ bài. Vui lòng thử lại.') from exc
+            print(f'[kiểm tra nguồn] định dạng không hợp lệ; thử lại {attempt + 1}/{REVIEW_REPAIR_ATTEMPTS}',
+                  file=sys.stderr)
+            repair = (prompt + '\n\nYour previous response was incomplete or had an invalid format (' +
+                      str(exc) + '). Redo this review using the original source and follow the exact '
+                      'opening and closing markers. Return the complete reviewed content; do not '
+                      'summarize or omit parts.\n\nPREVIOUS RESPONSE:\n' + reply)
+            reply = await ai_call(repair, images)
+
+
 async def review_material_and_quiz(context, schema, material, questions, images):
-    prompt = ('STAGE: SOURCE REVIEW\n' + GROUNDING_POLICY +
-              '\nIndependently review EVERY substantive claim and every quiz question, correct answer '
-              'and explanation against the original source and source images, not merely the draft or '
-              'knowledge map. Correct factual errors, keep numerical conditions attached to values, '
-              'remove or clearly qualify unsupported claims and invented guarantees. Explicitly report '
-              'source conflicts and uncertainty in the material rather than silently resolving them. '
-              'Preserve lesson coverage and valid educational explanations; do not fabricate evidence. '
-              'Keep or correct source locations for document-specific claims, especially PDF page '
-              'and table or figure references; never invent citations. '
-              'Keep valid image markdown and interactive blocks unchanged. When no external source '
-              'was provided, check general reasoning and avoid claiming document verification. '
-              'Return ONLY a JSON object with "material" (complete corrected Markdown string) and '
-              '"questions" (complete corrected JSON array in the same quiz format, same count). '
-              'If there are no questions return an empty array.\n\nORIGINAL SOURCE:\n' + context +
-              '\n\nKNOWLEDGE MAP (may contain errors, verify against original):\n' +
-              json.dumps(schema, ensure_ascii=False) + '\n\nLESSON TO REVIEW:\n' + material +
-              '\n\nQUIZ TO REVIEW:\n' + json.dumps(questions, ensure_ascii=False))
-    reviewed = parse_json_object(await ai_call(prompt, images), 'Kiểm tra nguồn')
-    checked_material = require_nonempty_text(reviewed.get('material'), 'Kiểm tra nguồn')
-    checked_questions = reviewed.get('questions')
-    try:
-        validate_quiz(checked_questions)
-        if len(checked_questions) != len(questions):
-            raise ValueError('Số câu hỏi sau kiểm tra không khớp.')
-    except ValueError as exc:
-        raise PipelineError('Kiểm tra nguồn: trắc nghiệm không hợp lệ; chưa chia sẻ bài: ' + str(exc)) from exc
+    evidence = ('\n\nORIGINAL SOURCE:\n' + context +
+                '\n\nKNOWLEDGE MAP (may contain errors, verify against original):\n' +
+                json.dumps(schema, ensure_ascii=False))
+    material_prompt = ('STAGE: SOURCE REVIEW MATERIAL\n' + GROUNDING_POLICY +
+                       '\nIndependently review EVERY substantive claim against the original source '
+                       'and source images, not merely the draft or knowledge map. Correct errors, '
+                       'preserve numerical conditions and valid coverage, and remove or qualify '
+                       'unsupported claims and guarantees. Explain source conflicts and uncertainty; '
+                       'keep or correct source locations without inventing citations. Keep valid '
+                       'image markdown and interactive blocks unchanged. When no external source '
+                       'was provided, check general reasoning and do not claim document verification. '
+                       'Return the COMPLETE corrected lesson as ordinary Markdown, NOT JSON. '
+                       'Put the following markers on their own lines, exactly once:\n' +
+                       REVIEW_MATERIAL_BEGIN + '\n[complete corrected Markdown lesson]\n' +
+                       REVIEW_MATERIAL_END + evidence + '\n\nLESSON TO REVIEW:\n' + material)
+    checked_material = await review_response(
+        material_prompt, images,
+        lambda reply: extract_review_section(reply, REVIEW_MATERIAL_BEGIN, REVIEW_MATERIAL_END),
+        'Kiểm tra học liệu')
+    if not questions:
+        return checked_material, []
+
+    quiz_prompt = ('STAGE: SOURCE REVIEW QUIZ\n' + GROUNDING_POLICY +
+                   '\nIndependently review every quiz question, answer and explanation against '
+                   'the original source and source images and the reviewed lesson. Correct errors, '
+                   'unsupported premises and invented guarantees; keep the same question count '
+                   'and the same JSON quiz format. Return ONLY the complete corrected JSON array '
+                   'between the markers below. Escape backslashes and newlines in JSON strings.\n' +
+                   REVIEW_QUIZ_BEGIN + '\n[complete corrected JSON quiz array]\n' + REVIEW_QUIZ_END +
+                   evidence + '\n\nREVIEWED LESSON:\n' + checked_material +
+                   '\n\nQUIZ TO REVIEW:\n' + json.dumps(questions, ensure_ascii=False))
+
+    def parse_reviewed_quiz(reply):
+        text = extract_review_section(reply, REVIEW_QUIZ_BEGIN, REVIEW_QUIZ_END)
+        result = parse_possibly_broken_json(text)
+        validate_quiz(result)
+        if len(result) != len(questions):
+            raise ValueError(f'Cần đúng {len(questions)} câu hỏi sau kiểm tra.')
+        return result
+
+    checked_questions = await review_response(quiz_prompt, images, parse_reviewed_quiz,
+                                              'Kiểm tra trắc nghiệm')
     return checked_material, checked_questions
 
 

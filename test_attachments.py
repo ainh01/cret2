@@ -96,8 +96,8 @@ async def fake_ai_call(user_message, images=None):
         return json.dumps({'concepts': [{'concept': 'chủ đề', 'details': 'chi tiết',
                                        'evidence': 'general knowledge', 'location': 'not supplied'}],
                            'uncertainties': [], 'outline': ['Bài học']})
-    if user_message.startswith('STAGE: SOURCE REVIEW'):
-        return json.dumps({'material': 'nội dung', 'questions': []})
+    if user_message.startswith('STAGE: SOURCE REVIEW MATERIAL'):
+        return app.REVIEW_MATERIAL_BEGIN + '\nnội dung\n' + app.REVIEW_MATERIAL_END
     return '```material\nnội dung\nendmaterial```'
 
 

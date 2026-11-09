@@ -34,8 +34,10 @@ class IllustrationTests(unittest.IsolatedAsyncioTestCase):
                 return '```material\n' + MATERIAL + 'endmaterial```'
             if prompt.startswith('Generate'):
                 return '```quiz\n' + json.dumps(quiz) + '\nendquiz```'
-            if prompt.startswith('STAGE: SOURCE REVIEW'):
-                return json.dumps({'material': MATERIAL, 'questions': quiz})
+            if prompt.startswith('STAGE: SOURCE REVIEW MATERIAL'):
+                return app.REVIEW_MATERIAL_BEGIN + '\n' + MATERIAL + '\n' + app.REVIEW_MATERIAL_END
+            if prompt.startswith('STAGE: SOURCE REVIEW QUIZ'):
+                return app.REVIEW_QUIZ_BEGIN + '\n' + json.dumps(quiz) + '\n' + app.REVIEW_QUIZ_END
             return json.dumps([{'section': 0, 'prompt': 'A detailed diagram of a cell', 'alt': 'Sơ đồ tế bào'}])
 
         async def fake_share(config, state):
@@ -76,7 +78,7 @@ class IllustrationTests(unittest.IsolatedAsyncioTestCase):
                         self.assertEqual(image.content, PNG)
                         self.assertEqual(image.headers['access-control-allow-origin'], '*')
                         self.assertEqual((await client.get('/generated-images/../../secret')).status_code, 404)
-                        self.assertEqual(len(calls), 6)
+                        self.assertEqual(len(calls), 7)
                         self.assertIn('factual accuracy', calls[-1])
 
     async def test_multiple_images_and_failure_cleanup(self):
