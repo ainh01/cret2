@@ -1223,7 +1223,7 @@ def assert_publishable_base_url(public_base_url):
 
 async def add_illustration(material, public_base_url):
     """Optional. Always reaches the image API when this step runs. A failed call keeps the lesson."""
-    diagrams = ascii_diagrams(material)
+    diagrams = diagram_replacement_spans(material)
     if diagrams:
         prompts = [(start, end, text, 'Sơ đồ') for start, end, text in diagrams]
         return await generate_and_insert(material, prompts, public_base_url, replace=True)
@@ -1271,7 +1271,7 @@ async def generate_and_insert(material, prompts, public_base_url, replace):
             path = IMAGE_DIR / filename
             with path.open('xb') as output:
                 output.write(data)
-            alt = re.sub(r'[\[\]\r\n\\]', ' ', item[3] or 'Minh họa').strip() or 'Minh họa'
+            alt = re.sub(r'[\[\]\r\n\\`]', ' ', item[3] or 'Minh họa').strip() or 'Minh họa'
             url = public_base_url.rstrip('/') + '/generated-images/' + filename
             saved.append((item[0], item[1], '![' + alt + '](' + url + ')'))
     except OSError as exc:
@@ -1279,7 +1279,9 @@ async def generate_and_insert(material, prompts, public_base_url, replace):
         return material
     for start, end, markdown in reversed(saved):
         if replace and end is not None:
-            material = material[:start] + markdown + material[end:]
+            # Own block, with a trailing newline. Gluing the link onto a following
+            # ``` leaves the fence open and turns the rest of the lesson into code.
+            material = material[:start] + '\n\n' + markdown + '\n\n' + material[end:]
         else:
             material = material[:start] + '\n\n' + markdown + '\n' + material[start:]
     return material
@@ -1321,6 +1323,94 @@ def ascii_diagrams(material):
         if len(found) >= MAX_ILLUSTRATIONS:
             break
     return found
+
+
+FENCE_LINE_RE = re.compile(r'^ {0,3}(`{3,}|~{3,})(.*)$')
+DIAGRAM_FENCE_INFO_RE = re.compile(r'(?i)text|txt|plain|ascii|diagram')
+
+
+def fence_regions(lines):
+    """Each fence as (opener line, closer line or None)."""
+    regions = []
+    active = None
+    for index, line in enumerate(lines):
+        match = FENCE_LINE_RE.match(line)
+        if not match:
+            continue
+        token, rest = match.group(1), match.group(2)
+        if active is None:
+            active = (index, token)
+        elif token[0] == active[1][0] and len(token) >= len(active[1]) and not rest.strip():
+            regions.append((active[0], index))
+            active = None
+    if active is not None:
+        regions.append((active[0], None))
+    return regions
+
+
+def diagram_fence_info(line):
+    info = (FENCE_LINE_RE.match(line).group(2) or '').strip()
+    return not info or DIAGRAM_FENCE_INFO_RE.fullmatch(info) is not None
+
+
+def diagram_replacement_spans(material):
+    """ASCII diagram spans, expanded so a wrapping fence is replaced with them.
+
+    The lesson model draws the diagram inside ``` ... ```. Replacing only the
+    drawing leaves the closer on the next line. Without a newline the image
+    link and the closer become one line, the fence never ends, and every
+    heading after it renders as code.
+    """
+    diagrams = ascii_diagrams(material)
+    if not diagrams:
+        return []
+    lines = material.splitlines(keepends=True)
+    line_offsets = []
+    cursor = 0
+    for line in lines:
+        line_offsets.append(cursor)
+        cursor += len(line)
+    line_offsets.append(cursor)
+    offset_index = {offset: index for index, offset in enumerate(line_offsets)}
+    located = []
+    for start, end, text in diagrams:
+        located.append((offset_index[start], offset_index[end], text, start, end))
+    consumed = set()
+    result = []
+    for opener, closer in fence_regions(lines):
+        if closer is None or not diagram_fence_info(lines[opener]):
+            continue
+        group = [item for item in located
+                 if item[1] > opener and item[0] < closer and item[1] <= closer]
+        if not group:
+            continue
+        covered = set()
+        for start_index, end_index, _text, _start, _end in group:
+            covered.update(range(start_index, end_index))
+        if any(lines[index].strip() and index not in covered for index in range(opener + 1, closer)):
+            continue
+        group.sort(key=lambda item: item[0])
+        fence_start = line_offsets[opener]
+        fence_end = line_offsets[closer + 1]
+        for index, item in enumerate(group):
+            span_start = min(fence_start, item[3]) if index == 0 else item[3]
+            span_end = fence_end if index == len(group) - 1 else group[index + 1][3]
+            result.append((span_start, span_end, item[2]))
+            consumed.add(item[3])
+    for start_index, end_index, text, start, end in located:
+        if start in consumed:
+            continue
+        expanded = start
+        for opener, closer in fence_regions(lines):
+            if closer is not None or opener >= start_index or not diagram_fence_info(lines[opener]):
+                continue
+            if any(line.strip() for line in lines[opener + 1:start_index]):
+                continue
+            expanded = line_offsets[opener]
+            break
+        result.append((expanded, end, text))
+    result.sort(key=lambda item: item[0])
+    return result
 
 
 # ---------------------------------------------------------------- document images

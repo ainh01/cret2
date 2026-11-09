@@ -207,5 +207,74 @@ class IllustrationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn('Không tạo được ảnh', enabled.text)
 
 
+    def test_ascii_replacement_does_not_leave_an_open_fence(self):
+        diagram = '┌──────────────┐\n│ USB Audio    │\n└──────────────┘\n'
+        material = (
+            '# Bản chất\n\n**ALC5686** là một giải pháp SoC.\n\n'
+            '```\n' + diagram + '```\n\n'
+            '**Chip** tích hợp các thành phần.\n\n'
+            '### Mục sau\n\nĐoạn sau phải còn là markdown.\n'
+        )
+        spans = app.diagram_replacement_spans(material)
+        self.assertEqual(len(spans), 1)
+        start, end, text = spans[0]
+        self.assertIn('USB Audio', text)
+        self.assertTrue(material[start:end].startswith('```'))
+        self.assertTrue(material[start:end].rstrip().endswith('```'))
+        replaced = material[:start] + '\n\n![Sơ đồ](https://cret.example/generated-images/a.jpg)\n\n' + material[end:]
+        self.assertNotIn('```', replaced)
+        self.assertNotRegex(replaced, r'\]\([^)\n]+\)`')
+        self.assertIn('### Mục sau', replaced)
+        self.assertIn('**Chip**', replaced)
+        self.assertLess(replaced.index('![Sơ đồ]'), replaced.index('### Mục sau'))
+
+    def test_label_before_fence_does_not_keep_the_fence(self):
+        material = 'Trước.\n\n[Sơ đồ khối]\n```\n┌──┐\n│A │\n└──┘\n```\n\n### Sau\n'
+        spans = app.diagram_replacement_spans(material)
+        start, end, _text = spans[0]
+        self.assertIn('```', material[start:end])
+        replaced = material[:start] + '\n\n![Sơ đồ](https://cret.example/a.jpg)\n\n' + material[end:]
+        self.assertNotIn('```', replaced)
+        self.assertIn('[Sơ đồ khối]', replaced)
+        self.assertIn('### Sau', replaced)
+        self.assertIn('Trước.', replaced)
+
+    def test_unclosed_diagram_fence_does_not_swallow_the_lesson(self):
+        material = '# Đầu\n\n```\n┌──┐\n│x │\n└──┘\n\n**Đậm** sau sơ đồ.\n\n### Mục\n'
+        spans = app.diagram_replacement_spans(material)
+        start, end, _text = spans[0]
+        self.assertTrue(material[start:end].startswith('```'))
+        self.assertNotIn('**Đậm**', material[start:end])
+        replaced = material[:start] + '\n\n![Sơ đồ](https://cret.example/a.jpg)\n\n' + material[end:]
+        self.assertNotIn('```', replaced)
+        self.assertIn('**Đậm** sau sơ đồ.', replaced)
+        self.assertIn('### Mục', replaced)
+
+    def test_interactive_fence_stays_closed(self):
+        material = '```interactive\n┌──┐\n│x │\n└──┘\n```\n\n**Sau**\n'
+        spans = app.diagram_replacement_spans(material)
+        start, end, _text = spans[0]
+        self.assertFalse(material[start:end].startswith('```'))
+        replaced = material[:start] + '\n\n![Sơ đồ](https://cret.example/a.jpg)\n\n' + material[end:]
+        self.assertIn('```interactive', replaced)
+        self.assertLess(replaced.index('```interactive'), replaced.index('![Sơ đồ]'))
+        self.assertLess(replaced.index('![Sơ đồ]'), replaced.rindex('```'))
+        self.assertGreater(replaced.index('**Sau**'), replaced.rindex('```'))
+
+    async def test_generated_ascii_image_replaces_the_fence(self):
+        material = '# Bài\n\n```\n┌──┐\n│A │\n└──┘\n```\n\n### Còn lại\n\n**Không** bị nuốt.\n'
+        async def fake_generate(prompt):
+            self.assertIn('┌', prompt)
+            return PNG, 'jpg'
+        with tempfile.TemporaryDirectory() as tmp, patch.object(app, 'IMAGE_DIR', Path(tmp)), \
+             patch.object(app, 'generated_image_bytes', fake_generate):
+            result = await app.add_illustration(material, 'https://cret.example')
+        self.assertEqual(result.count('```'), 0)
+        self.assertIn('![Sơ đồ](https://cret.example/generated-images/', result)
+        self.assertNotRegex(result, r'\]\([^)\n]+\)`')
+        self.assertLess(result.index('![Sơ đồ]'), result.index('### Còn lại'))
+        self.assertIn('**Không** bị nuốt.', result)
+
+
 if __name__ == '__main__':
     unittest.main()
