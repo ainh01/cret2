@@ -1100,28 +1100,44 @@ async def illustration_plan(material):
         'NUMBERED PARAGRAPHS:\n' + choices + '\n\nMATERIAL CONTEXT:\n' + material[:16000]
     )
     reply = (await ai_call(prompt)).strip()
-    reply = re.sub(r'^```(?:json)?\s*|\s*```$', '', reply, flags=re.IGNORECASE)
     try:
-        plans = json.loads(reply)
-        if not isinstance(plans, list) or not 1 <= len(plans) <= MAX_ILLUSTRATIONS:
-            raise ValueError('invalid illustration count')
-        result = []
-        seen = set()
-        for plan in plans:
-            index = plan['section']
-            description = plan['prompt']
-            alt = plan['alt']
-            if type(index) is not int or index < 0 or index >= len(sections) or index in seen:
-                raise ValueError('invalid or duplicate section')
-            if not isinstance(description, str) or not description.strip() or len(description) > 5000:
-                raise ValueError('invalid prompt')
-            if not isinstance(alt, str) or not alt.strip() or len(alt) > 300:
-                raise ValueError('invalid alt text')
-            seen.add(index)
-            result.append((sections[index][0], description.strip(), alt.strip()))
-    except (ValueError, KeyError, TypeError):
-        raise PipelineError('Không tạo được danh sách mô tả ảnh minh họa hợp lệ. Vui lòng thử lại.')
+        plans = parse_illustration_plans(reply, sections)
+    except (ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+        raise PipelineError('Không tạo được danh sách mô tả ảnh minh họa hợp lệ. Vui lòng thử lại.') from exc
+    return plans
+
+
+def parse_illustration_plans(reply, sections):
+    text = (reply or '').strip()
+    start, end = text.find('['), text.rfind(']')
+    if start == -1 or end <= start:
+        raise ValueError('invalid illustration json')
+    plans = json.loads(text[start:end + 1])
+    if not isinstance(plans, list) or not 1 <= len(plans) <= MAX_ILLUSTRATIONS:
+        raise ValueError('invalid illustration count')
+    result = []
+    seen = set()
+    for plan in plans:
+        index = plan['section']
+        description = plan['prompt']
+        alt = plan['alt']
+        if type(index) is not int or index < 0 or index >= len(sections) or index in seen:
+            raise ValueError('invalid or duplicate section')
+        if not isinstance(description, str) or not description.strip() or len(description) > 5000:
+            raise ValueError('invalid prompt')
+        if not isinstance(alt, str) or not alt.strip() or len(alt) > 300:
+            raise ValueError('invalid alt text')
+        seen.add(index)
+        result.append((sections[index][0], description.strip(), alt.strip()))
     return sorted(result, key=lambda item: item[0])
+
+
+def fallback_illustration_plans(sections):
+    """Still call the image API when the planner reply is unusable."""
+    result = []
+    for end, text, heading in sections[:MAX_ILLUSTRATIONS]:
+        result.append((end, 'Clear educational diagram of: ' + text[:800], heading or 'Minh họa'))
+    return result
 
 
 def image_extension(data):
@@ -1206,13 +1222,24 @@ def assert_publishable_base_url(public_base_url):
 
 
 async def add_illustration(material, public_base_url):
-    """Optional. A down image API or a bad plan leaves the lesson unchanged."""
+    """Optional. ASCII drawings already in the lesson are the image prompts."""
     try:
         assert_publishable_base_url(public_base_url)
+    except Exception as exc:
+        print(f'[minh họa] bỏ qua vì URL ảnh không dùng được: {exc.__class__.__name__}: {exc}', file=sys.stderr)
+        return material
+    diagrams = ascii_diagrams(material)
+    if diagrams:
+        return await replace_ascii_with_images(material, diagrams, public_base_url)
+    sections = illustration_sections(material)
+    if not sections:
+        print('[minh họa] không có đoạn văn để minh họa', file=sys.stderr)
+        return material
+    try:
         plans = await illustration_plan(material)
     except Exception as exc:
-        print(f'[minh họa] bỏ qua vì không lập được kế hoạch: {exc.__class__.__name__}: {exc}', file=sys.stderr)
-        return material
+        print(f'[minh họa] kế hoạch lỗi, vẫn gọi API ảnh: {exc.__class__.__name__}: {exc}', file=sys.stderr)
+        plans = fallback_illustration_plans(sections)
     semaphore = asyncio.Semaphore(ILLUSTRATION_CONCURRENCY)
 
     async def generate_one(plan):
@@ -1250,6 +1277,77 @@ async def add_illustration(material, public_base_url):
         return material
     for position, markdown in reversed(insertions):
         material = material[:position] + markdown + material[position:]
+    return material
+
+
+ASCII_ART_RE = re.compile(r'[│┌┐└┘├┤┬┴┼─═║╔╗╚╝╠╣╦╩╬▲▼►◄↑↓→←]|={3,}>|-{2,}>|═{2,}|─{2,}')
+
+
+def ascii_art_line(line):
+    stripped = line.strip()
+    return bool(stripped) and ASCII_ART_RE.search(stripped) is not None
+
+
+def ascii_diagrams(material):
+    """Blocks the lesson model already drew. The block text is the image prompt."""
+    lines = material.splitlines(keepends=True)
+    found = []
+    index = 0
+    offset = 0
+    while index < len(lines):
+        if not ascii_art_line(lines[index]):
+            offset += len(lines[index])
+            index += 1
+            continue
+        start = index
+        start_offset = offset
+        art = 0
+        while index < len(lines) and (ascii_art_line(lines[index]) or not lines[index].strip()):
+            if ascii_art_line(lines[index]):
+                art += 1
+            offset += len(lines[index])
+            index += 1
+        if art < 2:
+            continue
+        while start > 0 and re.fullmatch(r'\s*\[[^\]\n]{1,80}\]\s*', lines[start - 1]):
+            start -= 1
+            start_offset -= len(lines[start])
+        found.append((start_offset, offset, ''.join(lines[start:index]).strip()))
+        if len(found) >= MAX_ILLUSTRATIONS:
+            break
+    return found
+
+
+async def replace_ascii_with_images(material, diagrams, public_base_url):
+    semaphore = asyncio.Semaphore(ILLUSTRATION_CONCURRENCY)
+
+    async def generate_one(diagram):
+        async with semaphore:
+            try:
+                return await generated_image_bytes(diagram[2])
+            except Exception as exc:
+                print(f'[minh họa] bỏ một ảnh: {exc.__class__.__name__}: {exc}', file=sys.stderr)
+                return exc
+
+    generated = await asyncio.gather(*(generate_one(diagram) for diagram in diagrams))
+    replacements = []
+    try:
+        IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+        for (start, end, _prompt), result in zip(diagrams, generated):
+            if isinstance(result, BaseException):
+                continue
+            data, extension = result
+            filename = uuid.uuid4().hex + '.' + extension
+            path = IMAGE_DIR / filename
+            with path.open('xb') as output:
+                output.write(data)
+            url = public_base_url.rstrip('/') + '/generated-images/' + filename
+            replacements.append((start, end, '![' + 'Sơ đồ' + '](' + url + ')'))
+    except OSError as exc:
+        print(f'[minh họa] không lưu được ảnh, giữ sơ đồ chữ: {exc}', file=sys.stderr)
+        return material
+    for start, end, markdown in reversed(replacements):
+        material = material[:start] + markdown + material[end:]
     return material
 
 
