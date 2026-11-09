@@ -1223,7 +1223,7 @@ def assert_publishable_base_url(public_base_url):
 
 async def add_illustration(material, public_base_url):
     """Optional. Always reaches the image API when this step runs. A failed call keeps the lesson."""
-    diagrams = diagram_replacement_spans(material)
+    material, diagrams = prepare_diagram_replacements(material)
     if diagrams:
         prompts = [(start, end, text, 'Sơ đồ') for start, end, text in diagrams]
         return await generate_and_insert(material, prompts, public_base_url, replace=True)
@@ -1353,17 +1353,15 @@ def diagram_fence_info(line):
     return not info or DIAGRAM_FENCE_INFO_RE.fullmatch(info) is not None
 
 
-def diagram_replacement_spans(material):
-    """ASCII diagram spans, expanded so a wrapping fence is replaced with them.
+def unwrap_diagram_fences(material):
+    """Remove the fence around an ASCII diagram, including when a caption sits inside it.
 
-    The lesson model draws the diagram inside ``` ... ```. Replacing only the
-    drawing leaves the closer on the next line. Without a newline the image
-    link and the closer become one line, the fence never ends, and every
-    heading after it renders as code.
+    The image link has to be real markdown. A leftover ``` keeps it as text, which is
+    what happens if the fence also holds a caption line under the drawing.
     """
     diagrams = ascii_diagrams(material)
     if not diagrams:
-        return []
+        return material
     lines = material.splitlines(keepends=True)
     line_offsets = []
     cursor = 0
@@ -1372,45 +1370,25 @@ def diagram_replacement_spans(material):
         cursor += len(line)
     line_offsets.append(cursor)
     offset_index = {offset: index for index, offset in enumerate(line_offsets)}
-    located = []
-    for start, end, text in diagrams:
-        located.append((offset_index[start], offset_index[end], text, start, end))
-    consumed = set()
-    result = []
+    located = [(offset_index[start], offset_index[end]) for start, end, _text in diagrams]
+    drop = set()
     for opener, closer in fence_regions(lines):
-        if closer is None or not diagram_fence_info(lines[opener]):
+        if not diagram_fence_info(lines[opener]):
             continue
-        group = [item for item in located
-                 if item[1] > opener and item[0] < closer and item[1] <= closer]
-        if not group:
+        inside = [item for item in located if item[0] > opener and (closer is None or item[1] <= closer)]
+        if not inside:
             continue
-        covered = set()
-        for start_index, end_index, _text, _start, _end in group:
-            covered.update(range(start_index, end_index))
-        if any(lines[index].strip() and index not in covered for index in range(opener + 1, closer)):
-            continue
-        group.sort(key=lambda item: item[0])
-        fence_start = line_offsets[opener]
-        fence_end = line_offsets[closer + 1]
-        for index, item in enumerate(group):
-            span_start = min(fence_start, item[3]) if index == 0 else item[3]
-            span_end = fence_end if index == len(group) - 1 else group[index + 1][3]
-            result.append((span_start, span_end, item[2]))
-            consumed.add(item[3])
-    for start_index, end_index, text, start, end in located:
-        if start in consumed:
-            continue
-        expanded = start
-        for opener, closer in fence_regions(lines):
-            if closer is not None or opener >= start_index or not diagram_fence_info(lines[opener]):
-                continue
-            if any(line.strip() for line in lines[opener + 1:start_index]):
-                continue
-            expanded = line_offsets[opener]
-            break
-        result.append((expanded, end, text))
-    result.sort(key=lambda item: item[0])
-    return result
+        drop.add(opener)
+        if closer is not None:
+            drop.add(closer)
+    if not drop:
+        return material
+    return ''.join(line for index, line in enumerate(lines) if index not in drop)
+
+
+def prepare_diagram_replacements(material):
+    material = unwrap_diagram_fences(material)
+    return material, ascii_diagrams(material)
 
 
 # ---------------------------------------------------------------- document images

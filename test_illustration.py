@@ -215,47 +215,61 @@ class IllustrationTests(unittest.IsolatedAsyncioTestCase):
             '**Chip** tích hợp các thành phần.\n\n'
             '### Mục sau\n\nĐoạn sau phải còn là markdown.\n'
         )
-        spans = app.diagram_replacement_spans(material)
+        updated, spans = app.prepare_diagram_replacements(material)
         self.assertEqual(len(spans), 1)
+        self.assertNotIn('```', updated)
         start, end, text = spans[0]
         self.assertIn('USB Audio', text)
-        self.assertTrue(material[start:end].startswith('```'))
-        self.assertTrue(material[start:end].rstrip().endswith('```'))
-        replaced = material[:start] + '\n\n![Sơ đồ](https://cret.example/generated-images/a.jpg)\n\n' + material[end:]
+        replaced = updated[:start] + '\n\n![Sơ đồ](https://cret.example/generated-images/a.jpg)\n\n' + updated[end:]
         self.assertNotIn('```', replaced)
         self.assertNotRegex(replaced, r'\]\([^)\n]+\)`')
         self.assertIn('### Mục sau', replaced)
         self.assertIn('**Chip**', replaced)
         self.assertLess(replaced.index('![Sơ đồ]'), replaced.index('### Mục sau'))
 
+    def test_caption_inside_fence_does_not_keep_the_image_in_code(self):
+        caption = '[Màng loa Tai nghe 3.5mm] -> Âm thanh lọt vào tai người nghe'
+        material = (
+            'Trước.\n\n```\n┌──┐\n│A │\n└──┘\n\n' + caption + '\n```\n\n'
+            '**Realtek ALC5686** là giải pháp chip.\n'
+        )
+        updated, spans = app.prepare_diagram_replacements(material)
+        self.assertNotIn('```', updated)
+        self.assertIn(caption, updated)
+        start, end, _text = spans[0]
+        replaced = updated[:start] + '\n\n![Sơ đồ](https://cret.example/generated-images/a.jpg)\n\n' + updated[end:]
+        self.assertNotIn('```', replaced)
+        self.assertLess(replaced.index('![Sơ đồ]'), replaced.index(caption))
+        self.assertLess(replaced.index(caption), replaced.index('**Realtek ALC5686**'))
+
     def test_label_before_fence_does_not_keep_the_fence(self):
         material = 'Trước.\n\n[Sơ đồ khối]\n```\n┌──┐\n│A │\n└──┘\n```\n\n### Sau\n'
-        spans = app.diagram_replacement_spans(material)
+        updated, spans = app.prepare_diagram_replacements(material)
+        self.assertNotIn('```', updated)
+        self.assertIn('[Sơ đồ khối]', updated)
         start, end, _text = spans[0]
-        self.assertIn('```', material[start:end])
-        replaced = material[:start] + '\n\n![Sơ đồ](https://cret.example/a.jpg)\n\n' + material[end:]
+        replaced = updated[:start] + '\n\n![Sơ đồ](https://cret.example/a.jpg)\n\n' + updated[end:]
         self.assertNotIn('```', replaced)
-        self.assertIn('[Sơ đồ khối]', replaced)
         self.assertIn('### Sau', replaced)
         self.assertIn('Trước.', replaced)
 
     def test_unclosed_diagram_fence_does_not_swallow_the_lesson(self):
         material = '# Đầu\n\n```\n┌──┐\n│x │\n└──┘\n\n**Đậm** sau sơ đồ.\n\n### Mục\n'
-        spans = app.diagram_replacement_spans(material)
+        updated, spans = app.prepare_diagram_replacements(material)
+        self.assertNotIn('```', updated)
+        self.assertIn('**Đậm** sau sơ đồ.', updated)
         start, end, _text = spans[0]
-        self.assertTrue(material[start:end].startswith('```'))
-        self.assertNotIn('**Đậm**', material[start:end])
-        replaced = material[:start] + '\n\n![Sơ đồ](https://cret.example/a.jpg)\n\n' + material[end:]
-        self.assertNotIn('```', replaced)
-        self.assertIn('**Đậm** sau sơ đồ.', replaced)
+        self.assertNotIn('**Đậm**', updated[start:end])
+        replaced = updated[:start] + '\n\n![Sơ đồ](https://cret.example/a.jpg)\n\n' + updated[end:]
         self.assertIn('### Mục', replaced)
 
     def test_interactive_fence_stays_closed(self):
         material = '```interactive\n┌──┐\n│x │\n└──┘\n```\n\n**Sau**\n'
-        spans = app.diagram_replacement_spans(material)
+        updated, spans = app.prepare_diagram_replacements(material)
+        self.assertEqual(updated, material)
         start, end, _text = spans[0]
-        self.assertFalse(material[start:end].startswith('```'))
-        replaced = material[:start] + '\n\n![Sơ đồ](https://cret.example/a.jpg)\n\n' + material[end:]
+        self.assertNotIn('```', updated[start:end])
+        replaced = updated[:start] + '\n\n![Sơ đồ](https://cret.example/a.jpg)\n\n' + updated[end:]
         self.assertIn('```interactive', replaced)
         self.assertLess(replaced.index('```interactive'), replaced.index('![Sơ đồ]'))
         self.assertLess(replaced.index('![Sơ đồ]'), replaced.rindex('```'))
