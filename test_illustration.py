@@ -106,9 +106,10 @@ class IllustrationTests(unittest.IsolatedAsyncioTestCase):
             return PNG, 'png'
         with tempfile.TemporaryDirectory() as tmp, patch.object(app, 'IMAGE_DIR', Path(tmp)), \
              patch.object(app, 'ai_call', fake_ai), patch.object(app, 'generated_image_bytes', failing_generate):
-            with self.assertRaises(app.PipelineError):
-                await app.add_illustration(material, 'https://cret.example')
-            self.assertEqual(list(Path(tmp).iterdir()), [])
+            result = await app.add_illustration(material, 'https://cret.example')
+            self.assertEqual(result.count('!['), 2)
+            self.assertNotIn('Chức năng]', result)
+            self.assertEqual(len(list(Path(tmp).iterdir())), 2)
 
     async def test_reject_invalid_illustration_plans(self):
         material = 'Đây là một đoạn kiến thức dài và có nội dung rõ ràng.\n'
@@ -202,8 +203,8 @@ class IllustrationTests(unittest.IsolatedAsyncioTestCase):
                 enabled = await client.post('/api/api/generate', json={'input': 'topic', 'generate_illustration': True})
                 self.assertEqual(enabled.status_code, 404)
                 enabled = await client.post('/api/generate', json={'input': 'topic', 'generate_illustration': True})
-                self.assertIn('Không tạo được ảnh', enabled.text)
-                self.assertNotIn('"done": true', enabled.text)
+                self.assertIn('"done": true', enabled.text)
+                self.assertNotIn('Không tạo được ảnh', enabled.text)
 
 
 if __name__ == '__main__':

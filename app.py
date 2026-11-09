@@ -1206,26 +1206,32 @@ def assert_publishable_base_url(public_base_url):
 
 
 async def add_illustration(material, public_base_url):
-    assert_publishable_base_url(public_base_url)
-    plans = await illustration_plan(material)
+    """Optional. A down image API or a bad plan leaves the lesson unchanged."""
+    try:
+        assert_publishable_base_url(public_base_url)
+        plans = await illustration_plan(material)
+    except Exception as exc:
+        print(f'[minh họa] bỏ qua vì không lập được kế hoạch: {exc.__class__.__name__}: {exc}', file=sys.stderr)
+        return material
     semaphore = asyncio.Semaphore(ILLUSTRATION_CONCURRENCY)
 
     async def generate_one(plan):
         async with semaphore:
-            return await generated_image_bytes(plan[1])
+            try:
+                return await generated_image_bytes(plan[1])
+            except Exception as exc:
+                print(f'[minh họa] bỏ một ảnh: {exc.__class__.__name__}: {exc}', file=sys.stderr)
+                return exc
 
-    # Wait for all calls to settle before reporting a failure; no files are written
-    # until every image is available, so a failed call cannot leave a partial set.
-    generated = await asyncio.gather(*(generate_one(plan) for plan in plans), return_exceptions=True)
-    for result in generated:
-        if isinstance(result, BaseException):
-            raise PipelineError('Không tạo đủ ảnh minh họa. Vui lòng thử lại.') from result
-
+    generated = await asyncio.gather(*(generate_one(plan) for plan in plans))
     paths = []
     insertions = []
     try:
         IMAGE_DIR.mkdir(parents=True, exist_ok=True)
-        for (position, _, alt), (data, extension) in zip(plans, generated):
+        for (position, _, alt), result in zip(plans, generated):
+            if isinstance(result, BaseException):
+                continue
+            data, extension = result
             filename = uuid.uuid4().hex + '.' + extension
             path = IMAGE_DIR / filename
             with path.open('xb') as output:
@@ -1240,8 +1246,8 @@ async def add_illustration(material, public_base_url):
                 path.unlink(missing_ok=True)
             except OSError:
                 pass
-        raise PipelineError('Không lưu được ảnh minh họa trên server Cret2.') from exc
-    # Insert from the end so earlier offsets remain correct.
+        print(f'[minh họa] không lưu được ảnh, giữ bài không ảnh: {exc}', file=sys.stderr)
+        return material
     for position, markdown in reversed(insertions):
         material = material[:position] + markdown + material[position:]
     return material
@@ -1533,7 +1539,10 @@ async def run_pipeline(queue, user_input, reference='', images=None, question_co
 
     if generate_illustration:
         await queue.put({'stage': 'illustration'})
-        material_text = await add_illustration(material_text, public_base_url)
+        try:
+            material_text = await add_illustration(material_text, public_base_url)
+        except Exception as exc:
+            print(f'[minh họa] bỏ qua, vẫn chia sẻ bài: {exc.__class__.__name__}: {exc}', file=sys.stderr)
         material_text = ensure_document_links(material_text, document_images)
 
     await queue.put({'stage': 'share'})
