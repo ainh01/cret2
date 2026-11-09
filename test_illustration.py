@@ -171,7 +171,7 @@ class IllustrationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_detect_browser_url_and_fallback(self):
         seen = []
-        async def capture(queue, user_input, reference, images, question_count, enabled, public_url):
+        async def capture(queue, user_input, reference, images, question_count, enabled, public_url, document_images=None):
             seen.append(public_url)
             return 'https://example.org/abcdef'
         with patch.object(app, 'run_pipeline', capture):

@@ -135,6 +135,7 @@
 
   const STAGES = {
     material: 'Đang viết học liệu...',
+    figures: 'Đang đặt ảnh tài liệu...',
     quiz: 'Đang viết câu hỏi...',
     illustration: 'Đang tạo ảnh minh họa...',
     interactive: 'Đang thêm phần tương tác...',
@@ -260,7 +261,7 @@
       try { detail = formatDetail((await response.json()).detail); } catch (e) {}
       throw new Error(detail || ('Lỗi máy chủ (HTTP ' + response.status + ')'));
     }
-    return (await response.json()).text;
+    return await response.json();
   }
 
   function readImageDataUrl(file) {
@@ -324,30 +325,34 @@
     learnBtn.classList.add('loading');
 
     try {
-      const sources = [];
-      const images = [];
+      const parts = [];
+      let imageCount = 0;
       for (const item of plan) {
         if (item.kind === 'image') {
-          // Images are never converted or OCR'd: they travel to the model as-is.
-          images.push({ type: 'image_url', image_url: { url: await readImageDataUrl(item.file) } });
+          imageCount += 1;
+          parts.push({ kind: 'image', name: item.name, data_url: await readImageDataUrl(item.file) });
           continue;
         }
-        let text;
+        let converted;
         try {
-          text = await convertAttachment(item);
+          converted = await convertAttachment(item);
         } catch (err) {
           const label = item.kind === 'youtube' ? 'Không chuyển được video YouTube ' : 'Không chuyển được tệp ';
           throw new Error(label + '"' + item.name + '". ' + (err.message || ''));
         }
-        sources.push({ name: item.name, text: text });
+        const figures = converted.images || [];
+        imageCount += figures.length;
+        parts.push({ kind: 'source', name: item.name, text: converted.text || '', images: figures });
+      }
+      if (imageCount > 40) {
+        throw new Error('Tối đa 40 ảnh.');
       }
 
       statusEl.textContent = 'Đang bắt đầu...';
       const payload = { input: typed, question_count: requestedQuestionCount, generate_illustration: requestedIllustration };
-      if (requestedIllustration) payload.browser_base_url = new URL('.', window.location.href).href.replace(/\/$/, '');
+      payload.browser_base_url = new URL('.', window.location.href).href.replace(/\/$/, '');
       if (reference.code) payload.reference = reference.code;
-      if (sources.length) payload.sources = sources;
-      if (images.length) payload.images = images;
+      if (parts.length) payload.parts = parts;
 
       const response = await fetch('/api/generate', {
         method: 'POST',

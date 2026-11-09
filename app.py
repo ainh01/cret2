@@ -26,6 +26,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
 from default_config import DEFAULT_CONFIG
+import pdf_images
 
 ROOT = Path(__file__).parent
 ENV_PATH = Path(os.getenv('SETTINGS_ENV_PATH', str(ROOT / '.env')))
@@ -379,6 +380,32 @@ def convert_upload(path):
     return markitdown_text(markitdown_reader().convert_local(path))
 
 
+def figure_payload(figures):
+    images = []
+    for figure in figures:
+        data = figure["bytes"]
+        if data.startswith(b"\xff\xd8\xff"):
+            mime = "image/jpeg"
+        else:
+            mime = "image/png"
+        images.append({
+            "id": figure["id"],
+            "caption": figure.get("caption") or "",
+            "data_url": "data:" + mime + ";base64," + base64.b64encode(data).decode("ascii"),
+        })
+    return images
+
+
+def convert_pdf(path):
+    """PDF text plus every extracted figure. Blocking: call through asyncio.to_thread."""
+    text, figures = pdf_images.extract(path)
+    if figures:
+        return text, figures
+    # A text-only PDF keeps MarkItDown, which reads tables more cleanly.
+    fallback = convert_upload(path)
+    return fallback if (fallback or "").strip() else text, []
+
+
 def convert_link(url):
     """Convert one validated YouTube link to text. Blocking: call through asyncio.to_thread."""
     return markitdown_text(markitdown_reader().convert(url))
@@ -428,6 +455,7 @@ async def convert_attachment(file: UploadFile | None = File(None), url: str | No
     has_url = bool((url or '').strip())
     if has_file == has_url:
         raise HTTPException(400, 'Hãy chọn một tệp hoặc dán một liên kết YouTube.')
+    figures = []
 
     if has_file:
         data = await file.read()
@@ -439,8 +467,12 @@ async def convert_attachment(file: UploadFile | None = File(None), url: str | No
         try:
             path = directory / safe_upload_name(file.filename)
             path.write_bytes(data)
+            figures = []
             try:
-                text = await asyncio.to_thread(convert_upload, str(path))
+                if pdf_images.is_pdf(path, path.name):
+                    text, figures = await asyncio.to_thread(convert_pdf, str(path))
+                else:
+                    text = await asyncio.to_thread(convert_upload, str(path))
             except Exception as exc:
                 print(f'[chuyển đổi] lỗi khi đọc tệp: {exc.__class__.__name__}: {exc}', file=sys.stderr)
                 raise HTTPException(422, 'Không chuyển được tệp sang văn bản.')
@@ -463,11 +495,14 @@ async def convert_attachment(file: UploadFile | None = File(None), url: str | No
         if isinstance(text, str):
             text = youtube_content_or_raise(text)
 
-    if not isinstance(text, str) or not text.strip():
+    if (not isinstance(text, str) or not text.strip()) and not figures:
         raise HTTPException(422, 'Nội dung sau khi chuyển đổi rỗng.')
-    if len(text) > MAX_CONVERT_TEXT_CHARS:
+    if isinstance(text, str) and len(text) > MAX_CONVERT_TEXT_CHARS:
         raise HTTPException(413, 'Nội dung sau khi chuyển đổi quá dài (tối đa 1.000.000 ký tự).')
-    return {'text': text}
+    payload = {'text': text or ''}
+    if figures:
+        payload['images'] = figure_payload(figures)
+    return payload
 
 
 # ---------------------------------------------------------------- AI call
@@ -821,6 +856,8 @@ def build_quiz_repair_prompt(original_prompt, broken_reply, error_text):
 MAX_INPUT_CHARS = 1_000_000
 MAX_ATTACHMENTS = 20
 MAX_IMAGES = 10
+# PDF figures plus pasted images. Over this, fail the request; never drop one.
+MAX_DOCUMENT_IMAGES = 40
 MAX_IMAGE_RAW_BYTES = 20 * 1024 * 1024
 IMAGE_DATA_URL_RE = re.compile(r'^data:(image/(?:png|jpeg|webp|gif));base64,([A-Za-z0-9+/]+={0,2})$', re.IGNORECASE)
 
@@ -841,6 +878,29 @@ class ImagePart(BaseModel):
     image_url: ImageUrlPart
 
 
+class FigureIn(BaseModel):
+    id: str = Field(default='', max_length=40)
+    caption: str = Field(default='', max_length=500)
+    data_url: str = Field(min_length=1, max_length=MAX_REQUEST_BYTES)
+
+
+class OrderedPart(BaseModel):
+    """One attachment in the order the user added it. A PDF carries its figures."""
+
+    kind: str
+    name: str = Field(default='', max_length=500)
+    text: str = Field(default='', max_length=MAX_CONVERT_TEXT_CHARS)
+    data_url: str = Field(default='', max_length=MAX_REQUEST_BYTES)
+    images: list[FigureIn] = Field(default_factory=list)
+
+    @field_validator('kind')
+    @classmethod
+    def _kind(cls, value):
+        if value not in ('source', 'image'):
+            raise ValueError('kind')
+        return value
+
+
 class GenerateRequest(BaseModel):
     input: str | None = Field(default=None, max_length=MAX_INPUT_CHARS)
     reference: str | None = Field(default=None, max_length=2000)
@@ -849,6 +909,7 @@ class GenerateRequest(BaseModel):
     browser_base_url: str | None = Field(default=None, max_length=2000)
     sources: list[SourcePart] = Field(default_factory=list)
     images: list[ImagePart] = Field(default_factory=list)
+    parts: list[OrderedPart] = Field(default_factory=list)
 
     @field_validator('sources', mode='before')
     @classmethod
@@ -920,6 +981,59 @@ def join_source(user_input, sources):
             name = (source.get('name') or '').strip()
             chunks.append(f'Nguồn: {name}\n\n{text}' if name else text)
     return '\n\n'.join(chunks)
+
+
+def decode_image_data_url(url):
+    match = IMAGE_DATA_URL_RE.match((url or '').strip())
+    if match is None or len(match.group(2)) % 4:
+        raise HTTPException(422, 'Ảnh không hợp lệ (chỉ chấp nhận PNG, JPEG, WebP, GIF dạng data URL).')
+    if len(match.group(2)) // 4 * 3 > MAX_IMAGE_RAW_BYTES:
+        raise HTTPException(413, 'Ảnh quá lớn (tối đa 20 MiB mỗi ảnh).')
+    try:
+        data = base64.b64decode(match.group(2), validate=True)
+    except binascii.Error:
+        raise HTTPException(422, 'Ảnh không hợp lệ (chỉ chấp nhận PNG, JPEG, WebP, GIF dạng data URL).')
+    return data, match.group(1).lower()
+
+
+def assemble_parts(user_input, parts):
+    """Number every real image in attachment order and mark it in the source text."""
+    if len(parts) > MAX_ATTACHMENTS:
+        raise HTTPException(422, f'Tối đa {MAX_ATTACHMENTS} tệp đính kèm.')
+    chunks = []
+    if (user_input or '').strip():
+        chunks.append(user_input.strip())
+    records = []
+    number = 1
+    for part in parts:
+        if part.kind == 'image':
+            data, mime = decode_image_data_url(part.data_url)
+            label = f'Image #{number}'
+            chunks.append(f'[{label}]')
+            records.append({'number': number, 'label': label, 'caption': part.name or 'Ảnh đính kèm',
+                            'data': data, 'mime': mime})
+            number += 1
+            continue
+        text = part.text or ''
+        for figure in part.images:
+            data, mime = decode_image_data_url(figure.data_url)
+            label = f'Image #{number}'
+            marker = f'[{label}]'
+            token = f'[[fig:{figure.id}]]' if figure.id else ''
+            if token and token in text:
+                text = text.replace(token, marker, 1)
+            else:
+                text = (text.rstrip() + '\n\n' + marker).strip()
+            records.append({'number': number, 'label': label,
+                            'caption': figure.caption or label, 'data': data, 'mime': mime})
+            number += 1
+        text = text.strip()
+        if text:
+            name = (part.name or '').strip()
+            chunks.append(f'Nguồn: {name}\n\n{text}' if name else text)
+    if len(records) > MAX_DOCUMENT_IMAGES:
+        raise HTTPException(422, f'Tối đa {MAX_DOCUMENT_IMAGES} ảnh.')
+    return '\n\n'.join(chunks), records
 
 
 # ---------------------------------------------------------------- optional illustration
@@ -1077,7 +1191,7 @@ async def generated_image_bytes(prompt):
         raise PipelineError('Không tạo hoặc tải được ảnh minh họa. Kiểm tra cấu hình API ảnh và thử lại.') from exc
 
 
-async def add_illustration(material, public_base_url):
+def assert_publishable_base_url(public_base_url):
     if not validate_public_base_url(public_base_url):
         raise PipelineError('Không xác định được URL Cret2 để tạo link ảnh.')
     host = (urlsplit(public_base_url).hostname or '').lower()
@@ -1089,6 +1203,10 @@ async def add_illustration(material, public_base_url):
         pass
     if host in ('0.0.0.0', 'testserver') or host.endswith('.local'):
         raise PipelineError('Hãy mở Cret2 bằng địa chỉ công khai để người học tải được ảnh.')
+
+
+async def add_illustration(material, public_base_url):
+    assert_publishable_base_url(public_base_url)
     plans = await illustration_plan(material)
     semaphore = asyncio.Semaphore(ILLUSTRATION_CONCURRENCY)
 
@@ -1129,14 +1247,219 @@ async def add_illustration(material, public_base_url):
     return material
 
 
+# ---------------------------------------------------------------- document images
+
+MODEL_IMAGE_RE = re.compile(r'!\[[^\]]*\]\([^)\n]*\)')
+IMAGE_LABEL_RE = re.compile(r'\[Image #\d+\]')
+FIG_TOKEN_RE = re.compile(r'\[\[fig:[^\]]+\]\]')
+PLACE_REPAIR_ATTEMPTS = 2
+
+
+def strip_model_images(material):
+    """Drop image syntax the lesson model invented. The server writes the only links."""
+    material = MODEL_IMAGE_RE.sub('', material)
+    material = IMAGE_LABEL_RE.sub('', material)
+    material = FIG_TOKEN_RE.sub('', material)
+    return re.sub(r'\n{3,}', '\n\n', material).strip()
+
+
+def stamp_image(data, label):
+    """Copy sent to the model: a white band above the figure, labeled Image #N."""
+    try:
+        import pymupdf
+        if data.startswith(b'\xff\xd8\xff'):
+            filetype = 'jpeg'
+        elif data.startswith(b'GIF8'):
+            filetype = 'gif'
+        elif data.startswith(b'RIFF') and data[8:12] == b'WEBP':
+            filetype = 'webp'
+        else:
+            filetype = 'png'
+        src = pymupdf.open(stream=data, filetype=filetype)
+        pix = src[0].get_pixmap(alpha=False)
+        band = 48
+        width = max(pix.width, 180)
+        out = pymupdf.open()
+        page = out.new_page(width=width, height=pix.height + band)
+        page.draw_rect(pymupdf.Rect(0, 0, width, band), fill=(1, 1, 1), color=(1, 1, 1))
+        page.insert_textbox(pymupdf.Rect(10, 8, width - 10, band - 4), label,
+                           fontsize=18, fontname='helv', color=(0, 0, 0))
+        page.insert_image(pymupdf.Rect(0, band, pix.width, band + pix.height), pixmap=pix)
+        return page.get_pixmap(alpha=False).tobytes('png')
+    except Exception as exc:
+        print(f'[ảnh] không in được nhãn: {exc.__class__.__name__}: {exc}', file=sys.stderr)
+        return data
+
+
+def bytes_data_url(data):
+    if data.startswith(b'\xff\xd8\xff'):
+        mime = 'image/jpeg'
+    elif data.startswith(b'RIFF') and data[8:12] == b'WEBP':
+        mime = 'image/webp'
+    else:
+        mime = 'image/png'
+    return 'data:' + mime + ';base64,' + base64.b64encode(data).decode('ascii')
+
+
+def stamped_image_parts(records):
+    return [{'type': 'image_url', 'image_url': {'url': bytes_data_url(stamp_image(record['data'], record['label']))}}
+            for record in records]
+
+
+def storable_image(data):
+    if data.startswith(b'\x89PNG\r\n\x1a\n'):
+        return data, 'png'
+    if data.startswith(b'\xff\xd8\xff'):
+        return data, 'jpg'
+    if data.startswith(b'RIFF') and data[8:12] == b'WEBP':
+        return data, 'webp'
+    import pymupdf
+    if data.startswith(b'\xff\xd8\xff'):
+        src = pymupdf.open(stream=data, filetype='jpeg')
+    elif data.startswith(b'GIF8'):
+        src = pymupdf.open(stream=data, filetype='gif')
+    elif data.startswith(b'RIFF') and data[8:12] == b'WEBP':
+        src = pymupdf.open(stream=data, filetype='webp')
+    else:
+        src = pymupdf.open(stream=data, filetype='png')
+    return src[0].get_pixmap(alpha=False).tobytes('png'), 'png'
+
+
+def save_document_images(records, public_base_url):
+    assert_publishable_base_url(public_base_url)
+    IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+    paths = []
+    try:
+        for record in records:
+            data, extension = storable_image(record['data'])
+            filename = uuid.uuid4().hex + '.' + extension
+            path = IMAGE_DIR / filename
+            with path.open('xb') as output:
+                paths.append(path)
+                output.write(data)
+            url = public_base_url.rstrip('/') + '/generated-images/' + filename
+            record['markdown'] = '![' + record['label'] + '](' + url + ')'
+    except (OSError, Exception) as exc:
+        for path in paths:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        if isinstance(exc, PipelineError):
+            raise
+        raise PipelineError('Không lưu được ảnh tài liệu trên server Cret2.') from exc
+    return records
+
+
+def placement_prompt(material, sections, records):
+    choices = '\n'.join(f'{index} [heading: {heading or "(none)"}]: {text[:350]}'
+                        for index, (_, text, heading) in enumerate(sections))
+    catalog = '\n'.join(f'{record["number"]}. {record["caption"]}' for record in records)
+    return (
+        'Place each existing document image into the rewritten lesson. The lesson is not the '
+        'original document, so choose by meaning. Do not rewrite the lesson and do not write '
+        'markdown. Return ONLY a JSON array. Each object has "image" (the image number) and '
+        '"section" (a paragraph number below). Include every image exactly once.\n\n'
+        'IMAGES:\n' + catalog + '\n\nNUMBERED PARAGRAPHS:\n' + choices +
+        '\n\nLESSON:\n' + material[:16000]
+    )
+
+
+def placement_repair_prompt(original, broken, error_text):
+    return (
+        'Your previous image placement failed validation.\n\n'
+        'TASK:\n' + original + '\n\n'
+        'YOUR PREVIOUS ANSWER:\n' + broken + '\n\n'
+        'VALIDATION ERROR:\n' + error_text + '\n\n'
+        'Return ONLY a corrected JSON array of {"image", "section"} objects. Include every image once.'
+    )
+
+
+def parse_placement(reply, records, section_count):
+    text = (reply or '').strip()
+    text = re.sub(r'^```(?:json)?\s*|\s*```$', '', text, flags=re.IGNORECASE)
+    start, end = text.find('['), text.rfind(']')
+    if start == -1 or end <= start:
+        raise ValueError('Phản hồi không phải JSON.')
+    plans = json.loads(text[start:end + 1])
+    if not isinstance(plans, list):
+        raise ValueError('Phản hồi không phải một mảng.')
+    valid = {record['number'] for record in records}
+    assigned = {}
+    for plan in plans:
+        if not isinstance(plan, dict):
+            raise ValueError('Một mục không phải object.')
+        number, section = plan.get('image'), plan.get('section')
+        if type(number) is not int or number not in valid or number in assigned:
+            raise ValueError(f'Ảnh không hợp lệ hoặc bị lặp: {number}.')
+        if type(section) is not int or section < 0 or section >= section_count:
+            raise ValueError(f'Đoạn không hợp lệ: {section}.')
+        assigned[number] = section
+    return assigned
+
+
+def insert_document_links(material, records, assigned, sections):
+    insertions = []
+    used = set()
+    for number, section in assigned.items():
+        record = next(item for item in records if item['number'] == number)
+        insertions.append((sections[section][0], number, record['markdown']))
+        used.add(number)
+    end = len(material)
+    for record in records:
+        if record['number'] not in used:
+            insertions.append((end, record['number'], record['markdown']))
+    for position, _number, markdown in sorted(insertions, key=lambda item: (item[0], -item[1]), reverse=True):
+        material = material[:position] + '\n\n' + markdown + '\n' + material[position:]
+    return material
+
+
+def ensure_document_links(material, records):
+    missing = [record['markdown'] for record in records if record.get('markdown') and record['markdown'] not in material]
+    if not missing:
+        return material
+    return material.rstrip() + '\n\n' + '\n\n'.join(missing) + '\n'
+
+
+async def place_document_images(material, records, public_base_url, stamped):
+    """Save the clean figures, then put each one after a paragraph of the written lesson."""
+    save_document_images(records, public_base_url)
+    material = strip_model_images(material)
+    sections = illustration_sections(material)
+    assigned = {}
+    if sections:
+        prompt = placement_prompt(material, sections, records)
+        reply = ''
+        for attempt in range(PLACE_REPAIR_ATTEMPTS + 1):
+            try:
+                if attempt == 0:
+                    reply = (await ai_call(prompt, stamped)).strip()
+                assigned = parse_placement(reply, records, len(sections))
+                missing = [record['label'] for record in records if record['number'] not in assigned]
+                if missing:
+                    raise ValueError('Thiếu ảnh: ' + ', '.join(missing))
+                break
+            except (ValueError, PipelineError, json.JSONDecodeError) as exc:
+                print(f'[ảnh tài liệu] đặt ảnh lần {attempt + 1} lỗi: {exc}', file=sys.stderr)
+                if attempt >= PLACE_REPAIR_ATTEMPTS:
+                    break
+                try:
+                    reply = (await ai_call(placement_repair_prompt(prompt, reply, str(exc)), stamped)).strip()
+                except PipelineError as repair_error:
+                    print(f'[ảnh tài liệu] không sửa được vị trí ảnh: {repair_error}', file=sys.stderr)
+                    break
+    return insert_document_links(material, records, assigned, sections)
+
+
 # ---------------------------------------------------------------- generation pipeline
 
 async def run_pipeline(queue, user_input, reference='', images=None, question_count=6,
-                       generate_illustration=False, public_base_url=''):
+                       generate_illustration=False, public_base_url='', document_images=None):
     cfg = load_config()
     user_input = user_input or ''
     images = list(images or [])
-    if not user_input.strip() and not images:
+    document_images = list(document_images or [])
+    if not user_input.strip() and not images and not document_images:
         raise PipelineError('Hãy nhập nội dung bạn muốn học.')
     try:
         reference_code = parse_reference(reference)
@@ -1144,8 +1467,15 @@ async def run_pipeline(queue, user_input, reference='', images=None, question_co
         raise PipelineError(str(exc))
     reference_material = await fetch_reference_material(cfg, reference_code) if reference_code else ''
     steps = cfg['steps']
-    # Images ride along with the first enabled step that consumes the raw input.
+    # Legacy attached images ride the first enabled step. Document images are labeled
+    # and stay visible to every step that reads the lesson.
     image_step = next((name for name in ('material', 'quiz', 'interactive') if steps[name]['enabled']), None)
+    document_parts = stamped_image_parts(document_images) if document_images else None
+
+    def step_images(name):
+        if document_parts is not None:
+            return document_parts
+        return images if image_step == name else None
 
     material_text = user_input
     if steps['material']['enabled']:
@@ -1153,11 +1483,15 @@ async def run_pipeline(queue, user_input, reference='', images=None, question_co
         prompt = steps['material']['template'] + '\n\n' + user_input
         if reference_material:
             prompt += '\n\n' + REFERENCE_PROMPT_LABEL + '\n' + reference_material
-        reply = await ai_call(prompt, images if image_step == 'material' else None)
+        reply = await ai_call(prompt, step_images('material'))
         extracted = extract_block(reply, '```material', 'endmaterial```')
         material_text = extracted if extracted is not None else reply
         if not material_text.strip():
             raise PipelineError('Mô hình không trả về khối học liệu nào.')
+
+    if document_images:
+        await queue.put({'stage': 'figures'})
+        material_text = await place_document_images(material_text, document_images, public_base_url, document_parts)
 
     questions = []
     if steps['quiz']['enabled']:
@@ -1168,7 +1502,7 @@ async def run_pipeline(queue, user_input, reference='', images=None, question_co
         quiz_prompt = (quiz_template + '\n\n' + material_text +
                        f'\n\nIMPORTANT: Generate exactly {question_count} questions. '
                        'This requirement overrides any other question count in the instructions.')
-        quiz_images = images if image_step == 'quiz' else None
+        quiz_images = step_images('quiz')
         reply = await ai_call(quiz_prompt, quiz_images)
         parsed = None
         for attempt in range(QUIZ_REPAIR_ATTEMPTS + 1):
@@ -1191,16 +1525,16 @@ async def run_pipeline(queue, user_input, reference='', images=None, question_co
 
     if steps['interactive']['enabled']:
         await queue.put({'stage': 'interactive'})
-        reply = await ai_call(steps['interactive']['template'] + '\n\n' + material_text,
-                              images if image_step == 'interactive' else None)
+        reply = await ai_call(steps['interactive']['template'] + '\n\n' + material_text, step_images('interactive'))
         extracted = extract_block(reply, '```material', 'endmaterial```')
         replacement = extracted if extracted is not None else reply
         if replacement.strip():
-            material_text = replacement
+            material_text = ensure_document_links(replacement, document_images)
 
     if generate_illustration:
         await queue.put({'stage': 'illustration'})
         material_text = await add_illustration(material_text, public_base_url)
+        material_text = ensure_document_links(material_text, document_images)
 
     await queue.put({'stage': 'share'})
     state = {
@@ -1225,11 +1559,16 @@ async def validation_handler(request, exc):
 @app.post('/api/generate')
 async def generate(request: Request, body: GenerateRequest | None = None):
     body = body or GenerateRequest()
-    sources, images = validate_attachments(body)
-    source_payload = [{'name': source.name, 'text': source.text} for source in sources]
-    image_payload = [part.model_dump() for part in images]
-    # Converted attachments land after the typed input, as extra source material.
-    material_input = join_source(body.input or '', source_payload)
+    if body.parts:
+        material_input, document_images = assemble_parts(body.input or '', body.parts)
+        image_payload = []
+    else:
+        sources, images = validate_attachments(body)
+        source_payload = [{'name': source.name, 'text': source.text} for source in sources]
+        image_payload = [part.model_dump() for part in images]
+        document_images = []
+        # Converted attachments land after the typed input, as extra source material.
+        material_input = join_source(body.input or '', source_payload)
     if len(material_input) > MAX_INPUT_CHARS:
         raise HTTPException(422, 'Nội dung quá dài (giới hạn 1.000.000 ký tự).')
     queue = asyncio.Queue()
@@ -1238,7 +1577,8 @@ async def generate(request: Request, body: GenerateRequest | None = None):
     async def produce():
         try:
             link = await run_pipeline(queue, material_input, body.reference or '', image_payload,
-                                      body.question_count, body.generate_illustration, public_base_url)
+                                      body.question_count, body.generate_illustration, public_base_url,
+                                      document_images=document_images)
             await queue.put({'done': True, 'link': link})
         except PipelineError as exc:
             await queue.put({'error': str(exc)})

@@ -7,3 +7,5 @@ python-multipart>=0.0.20,<1
 # attachment import: documents, audio and YouTube links are converted to Markdown/text.
 # Audio conversion (wav/mp3) additionally needs FFmpeg installed on the host.
 markitdown[pptx,docx,xlsx,xls,pdf,audio-transcription,youtube-transcription]>=0.1.8,<1
+# PDF figures: embedded images plus vector diagrams rendered from the page.
+pymupdf>=1.26,<3
