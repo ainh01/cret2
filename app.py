@@ -1222,61 +1222,66 @@ def assert_publishable_base_url(public_base_url):
 
 
 async def add_illustration(material, public_base_url):
-    """Optional. ASCII drawings already in the lesson are the image prompts."""
-    try:
-        assert_publishable_base_url(public_base_url)
-    except Exception as exc:
-        print(f'[minh họa] bỏ qua vì URL ảnh không dùng được: {exc.__class__.__name__}: {exc}', file=sys.stderr)
-        return material
+    """Optional. Always reaches the image API when this step runs. A failed call keeps the lesson."""
     diagrams = ascii_diagrams(material)
     if diagrams:
-        return await replace_ascii_with_images(material, diagrams, public_base_url)
+        prompts = [(start, end, text, 'Sơ đồ') for start, end, text in diagrams]
+        return await generate_and_insert(material, prompts, public_base_url, replace=True)
     sections = illustration_sections(material)
-    if not sections:
-        print('[minh họa] không có đoạn văn để minh họa', file=sys.stderr)
-        return material
-    try:
-        plans = await illustration_plan(material)
-    except Exception as exc:
-        print(f'[minh họa] kế hoạch lỗi, vẫn gọi API ảnh: {exc.__class__.__name__}: {exc}', file=sys.stderr)
-        plans = fallback_illustration_plans(sections)
+    if sections:
+        try:
+            plans = await illustration_plan(material)
+        except Exception as exc:
+            print(f'[minh họa] kế hoạch lỗi, vẫn gọi API ảnh: {exc.__class__.__name__}: {exc}', file=sys.stderr)
+            plans = fallback_illustration_plans(sections)
+    else:
+        excerpt = material.strip()[:800]
+        if not excerpt:
+            return material
+        plans = [(len(material), excerpt, 'Minh họa')]
+    prompts = [(position, None, prompt, alt) for position, prompt, alt in plans]
+    return await generate_and_insert(material, prompts, public_base_url, replace=False)
+
+
+async def generate_and_insert(material, prompts, public_base_url, replace):
     semaphore = asyncio.Semaphore(ILLUSTRATION_CONCURRENCY)
 
-    async def generate_one(plan):
+    async def generate_one(item):
         async with semaphore:
             try:
-                return await generated_image_bytes(plan[1])
+                return await generated_image_bytes(item[2])
             except Exception as exc:
                 print(f'[minh họa] bỏ một ảnh: {exc.__class__.__name__}: {exc}', file=sys.stderr)
                 return exc
 
-    generated = await asyncio.gather(*(generate_one(plan) for plan in plans))
-    paths = []
-    insertions = []
+    generated = await asyncio.gather(*(generate_one(item) for item in prompts))
+    try:
+        assert_publishable_base_url(public_base_url)
+    except Exception as exc:
+        print(f'[minh họa] đã gọi API ảnh, không lưu được link: {exc.__class__.__name__}: {exc}', file=sys.stderr)
+        return material
+    saved = []
     try:
         IMAGE_DIR.mkdir(parents=True, exist_ok=True)
-        for (position, _, alt), result in zip(plans, generated):
+        for item, result in zip(prompts, generated):
             if isinstance(result, BaseException):
                 continue
             data, extension = result
             filename = uuid.uuid4().hex + '.' + extension
             path = IMAGE_DIR / filename
             with path.open('xb') as output:
-                paths.append(path)
                 output.write(data)
-            alt = re.sub(r'[\[\]\r\n\\]', ' ', alt).strip()
+            alt = re.sub(r'[\[\]\r\n\\]', ' ', item[3] or 'Minh họa').strip() or 'Minh họa'
             url = public_base_url.rstrip('/') + '/generated-images/' + filename
-            insertions.append((position, '\n\n![' + alt + '](' + url + ')\n'))
+            saved.append((item[0], item[1], '![' + alt + '](' + url + ')'))
     except OSError as exc:
-        for path in paths:
-            try:
-                path.unlink(missing_ok=True)
-            except OSError:
-                pass
-        print(f'[minh họa] không lưu được ảnh, giữ bài không ảnh: {exc}', file=sys.stderr)
+        print(f'[minh họa] không lưu được ảnh, giữ bài: {exc}', file=sys.stderr)
         return material
-    for position, markdown in reversed(insertions):
-        material = material[:position] + markdown + material[position:]
+    for start, end, markdown in reversed(saved):
+        if replace and end is not None:
+            material = material[:start] + markdown + material[end:]
+        else:
+            material = material[:start] + '\n\n' + markdown + '\n' + material[start:]
     return material
 
 
@@ -1316,39 +1321,6 @@ def ascii_diagrams(material):
         if len(found) >= MAX_ILLUSTRATIONS:
             break
     return found
-
-
-async def replace_ascii_with_images(material, diagrams, public_base_url):
-    semaphore = asyncio.Semaphore(ILLUSTRATION_CONCURRENCY)
-
-    async def generate_one(diagram):
-        async with semaphore:
-            try:
-                return await generated_image_bytes(diagram[2])
-            except Exception as exc:
-                print(f'[minh họa] bỏ một ảnh: {exc.__class__.__name__}: {exc}', file=sys.stderr)
-                return exc
-
-    generated = await asyncio.gather(*(generate_one(diagram) for diagram in diagrams))
-    replacements = []
-    try:
-        IMAGE_DIR.mkdir(parents=True, exist_ok=True)
-        for (start, end, _prompt), result in zip(diagrams, generated):
-            if isinstance(result, BaseException):
-                continue
-            data, extension = result
-            filename = uuid.uuid4().hex + '.' + extension
-            path = IMAGE_DIR / filename
-            with path.open('xb') as output:
-                output.write(data)
-            url = public_base_url.rstrip('/') + '/generated-images/' + filename
-            replacements.append((start, end, '![' + 'Sơ đồ' + '](' + url + ')'))
-    except OSError as exc:
-        print(f'[minh họa] không lưu được ảnh, giữ sơ đồ chữ: {exc}', file=sys.stderr)
-        return material
-    for start, end, markdown in reversed(replacements):
-        material = material[:start] + markdown + material[end:]
-    return material
 
 
 # ---------------------------------------------------------------- document images

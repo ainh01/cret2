@@ -80,7 +80,7 @@
   try {
     const savedCount = localStorage.getItem(QUESTION_COUNT_KEY);
     if (savedCount !== null && validQuestionCount(savedCount)) questionCount = Number(savedCount);
-    illustrationEl.checked = localStorage.getItem(ILLUSTRATION_KEY) === 'true';
+    illustrationEl.checked = localStorage.getItem(ILLUSTRATION_KEY) !== 'false';
   } catch (e) {
     storageStatusEl.textContent = 'Không lưu được cài đặt trên trình duyệt này.';
   }
