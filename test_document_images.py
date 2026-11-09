@@ -62,8 +62,17 @@ calls = []
 
 async def fake_ai(prompt, images=None):
     calls.append({'prompt': prompt, 'images': images})
+    if prompt.startswith('STAGE: KNOWLEDGE'):
+        return json.dumps({'concepts': [{'concept': 'Sơ đồ', 'details': 'Nguồn có sơ đồ',
+                                       'evidence': 'Nguồn có [Image #2] ngay sơ đồ.', 'location': 'a.pdf'}],
+                           'uncertainties': [], 'outline': ['Sơ đồ']})
+    if prompt.startswith('STAGE: CREATE'):
+        return '```material\n' + MATERIAL + '\nendmaterial```'
     if prompt.startswith('HỌC'):
         return '```material\n' + MATERIAL + '\n![bịa](http://evil.example/x.png)\n[Image #1]\nendmaterial```'
+    if prompt.startswith('STAGE: SOURCE REVIEW'):
+        return json.dumps({'material': MATERIAL + '\n![bịa](http://evil.example/x.png)\n[Image #1]',
+                           'questions': quiz})
     if prompt.startswith('Generate'):
         return '```quiz\n' + json.dumps(quiz) + '\nendquiz```'
     if 'placement failed' in prompt:
@@ -108,7 +117,7 @@ with tempfile.TemporaryDirectory() as tmp, \
     assert response.status_code == 200, response.text
     events = [json.loads(line) for line in response.text.splitlines() if line.strip()]
     assert events[-1]['done'] is True, events
-    assert [event['stage'] for event in events if 'stage' in event] == ['material', 'figures', 'quiz', 'share']
+    assert [event['stage'] for event in events if 'stage' in event] == ['schema', 'draft', 'material', 'quiz', 'verify', 'figures', 'share']
     assert '[Image #1]' in calls[0]['prompt'] and '[Image #2]' in calls[0]['prompt']
     assert '[[fig:1]]' not in calls[0]['prompt']
     stamped = base64.b64decode(calls[0]['images'][0]['image_url']['url'].split(',', 1)[1])

@@ -36,11 +36,15 @@ class QuestionCountTests(unittest.TestCase):
 
     def request(self, payload, responses):
         self.responses = list(responses)
+        generated = []
 
         async def fake_ai(prompt, images=None):
             self.prompts.append(prompt)
+            if prompt.startswith('STAGE: SOURCE REVIEW'):
+                return json.dumps({'material': 'đề bài', 'questions': generated})
             data = self.responses.pop(0)
-            return '```quiz\n' + json.dumps([question(i) for i in range(data)]) + '\nendquiz```'
+            generated[:] = [question(i) for i in range(data)]
+            return '```quiz\n' + json.dumps(generated) + '\nendquiz```'
 
         async def fake_share(config, state):
             self.saved.append(state)
@@ -57,18 +61,18 @@ class QuestionCountTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertTrue(events[-1]['done'])
         self.assertEqual(len(self.saved[-1]['questions']), 6)
-        self.assertIn('Generate exactly 6 questions', self.prompts[-1])
+        self.assertTrue(any('Generate exactly 6 questions' in prompt for prompt in self.prompts))
 
         response, events = self.request({'input': 'đề bài', 'question_count': 3}, [3])
         self.assertTrue(events[-1]['done'])
         self.assertEqual(len(self.saved[-1]['questions']), 3)
-        self.assertIn('Generate 3 questions. Custom instructions.', self.prompts[-1])
-        self.assertNotIn('Generate 6 questions', self.prompts[-1])
+        self.assertTrue(any('Generate 3 questions. Custom instructions.' in prompt for prompt in self.prompts))
+        self.assertNotIn('Generate 6 questions', self.prompts[-2])
 
     def test_wrong_count_is_retried_and_not_published(self):
         response, events = self.request({'input': 'đề bài', 'question_count': 2}, [1, 2])
         self.assertTrue(events[-1]['done'])
-        self.assertIn('Cần đúng 2 câu hỏi', self.prompts[-1])
+        self.assertTrue(any('Cần đúng 2 câu hỏi' in prompt for prompt in self.prompts))
         self.assertEqual(len(self.saved[-1]['questions']), 2)
 
         self.saved.clear()

@@ -26,10 +26,16 @@ class IllustrationTests(unittest.IsolatedAsyncioTestCase):
 
         async def fake_ai(prompt, images=None):
             calls.append(prompt)
-            if prompt.startswith('MATERIAL'):
+            if prompt.startswith('STAGE: KNOWLEDGE'):
+                return json.dumps({'concepts': [{'concept': 'cell', 'details': 'structure',
+                                               'evidence': 'general knowledge', 'location': 'not supplied'}],
+                                   'uncertainties': [], 'outline': ['cell']})
+            if prompt.startswith('STAGE: CREATE') or prompt.startswith('MATERIAL'):
                 return '```material\n' + MATERIAL + 'endmaterial```'
             if prompt.startswith('Generate'):
                 return '```quiz\n' + json.dumps(quiz) + '\nendquiz```'
+            if prompt.startswith('STAGE: SOURCE REVIEW'):
+                return json.dumps({'material': MATERIAL, 'questions': quiz})
             return json.dumps([{'section': 0, 'prompt': 'A detailed diagram of a cell', 'alt': 'Sơ đồ tế bào'}])
 
         async def fake_share(config, state):
@@ -60,7 +66,7 @@ class IllustrationTests(unittest.IsolatedAsyncioTestCase):
                                                                           'browser_base_url': 'https://cret.example.com/prefix'})
                         events = [json.loads(line) for line in response.text.splitlines() if line]
                         self.assertEqual([e['stage'] for e in events if 'stage' in e],
-                                         ['material', 'quiz', 'illustration', 'share'])
+                                         ['schema', 'draft', 'material', 'quiz', 'verify', 'illustration', 'share'])
                         self.assertTrue(events[-1]['done'])
                         material = shared[-1]['material']
                         self.assertIn('![Sơ đồ tế bào](https://cret.example.com/prefix/generated-images/', material)
@@ -70,8 +76,8 @@ class IllustrationTests(unittest.IsolatedAsyncioTestCase):
                         self.assertEqual(image.content, PNG)
                         self.assertEqual(image.headers['access-control-allow-origin'], '*')
                         self.assertEqual((await client.get('/generated-images/../../secret')).status_code, 404)
-                        self.assertEqual(len(calls), 3)
-                        self.assertIn('factual accuracy', calls[2])
+                        self.assertEqual(len(calls), 6)
+                        self.assertIn('factual accuracy', calls[-1])
 
     async def test_multiple_images_and_failure_cleanup(self):
         material = ('# Giới thiệu\n\nĐây là nội dung đầu tiên về tế bào và cấu trúc.\n\n'
@@ -267,13 +273,92 @@ class IllustrationTests(unittest.IsolatedAsyncioTestCase):
         material = '```interactive\n┌──┐\n│x │\n└──┘\n```\n\n**Sau**\n'
         updated, spans = app.prepare_diagram_replacements(material)
         self.assertEqual(updated, material)
+        self.assertEqual(spans, [])
+
+    def test_plus_pipe_diagram_replaces_the_drawing(self):
+        drawing = (
+            '+---------------------------------------------+\n'
+            '|              ALC5686 SoC                    |\n'
+            '|                                             |\n'
+            '[Cổng Type-C] ===> [USB 2.0 PHY] -> [DAC] ===> [Tai nghe]\n'
+            '(Dữ liệu số) |                    |   | (Âm thanh Hi-Fi)\n'
+            '| [Buck DC-DC] [256KB Flash] [Class-G Amp] |\n'
+            '+---------------------------------------------+\n'
+        )
+        material = 'Trước.\n\n```\n' + drawing + '```\n\n**Sau**\n'
+        updated, spans = app.prepare_diagram_replacements(material)
+        self.assertNotIn('```', updated)
+        self.assertEqual(len(spans), 1)
+        self.assertIn('ALC5686', spans[0][2])
+        self.assertIn('Buck DC-DC', spans[0][2])
         start, end, _text = spans[0]
-        self.assertNotIn('```', updated[start:end])
         replaced = updated[:start] + '\n\n![Sơ đồ](https://cret.example/a.jpg)\n\n' + updated[end:]
-        self.assertIn('```interactive', replaced)
-        self.assertLess(replaced.index('```interactive'), replaced.index('![Sơ đồ]'))
-        self.assertLess(replaced.index('![Sơ đồ]'), replaced.rindex('```'))
-        self.assertGreater(replaced.index('**Sau**'), replaced.rindex('```'))
+        self.assertNotIn('+---', replaced)
+        self.assertNotIn('```', replaced)
+        self.assertIn('**Sau**', replaced)
+        self.assertLess(replaced.index('![Sơ đồ]'), replaced.index('**Sau**'))
+
+    def test_indented_drawing_does_not_stay_a_code_block(self):
+        drawing = (
+            '    +---------------------------------------------+\n'
+            '    |              ALC5686 SoC                    |\n'
+            '    [Cổng Type-C] ===> [USB 2.0 PHY] -> [DAC] ===> [Tai nghe]\n'
+            '    +---------------------------------------------+\n'
+            '\n'
+            '    Chân số 2 và 3 bị tráo đổi giữa CTIA & OMTP!\n'
+        )
+        material = 'Trước.\n\n```\n' + drawing + '```\n\n**Sau**\n'
+        updated, spans = app.prepare_diagram_replacements(material)
+        self.assertNotIn('```', updated)
+        self.assertNotRegex(updated, r'(?m)^ {4}\S')
+        self.assertEqual(len(spans), 1)
+        self.assertIn('ALC5686', spans[0][2])
+        start, end, _text = spans[0]
+        replaced = updated[:start] + '\n\n![Sơ đồ](https://cret.example/a.jpg)\n\n' + updated[end:]
+        self.assertNotRegex(replaced, r'(?m)^ {4}\S')
+        self.assertNotIn('+---', replaced)
+        self.assertIn('Chân số 2 và 3', replaced)
+        self.assertLess(replaced.index('![Sơ đồ]'), replaced.index('Chân số 2 và 3'))
+        self.assertLess(replaced.index('Chân số 2 và 3'), replaced.index('**Sau**'))
+
+    def test_bracket_dash_pinout_is_one_diagram(self):
+        material = (
+            'Jack.\n\n```\n'
+            'Chuẩn CTIA (Apple, Android đời mới...):\n'
+            '[ Tip: Trái (L) ]——[ Ring 1: Phải (R) ]——[ Ring 2: Nối Đất (GND) ]——[ Sleeve: Tín hiệu Micro (MIC) ]\n'
+            '\n'
+            'Chuẩn OMTP (Nokia cũ...):\n'
+            '[ Tip: Trái (L) ]——[ Ring 1: Phải (R) ]——[ Ring 2: Tín hiệu Micro (MIC) ]——[ Sleeve: Nối Đất (GND) ]\n'
+            '\n'
+            'Tip    Ring 1    Ring 2    Sleeve\n'
+            '```\n\n'
+            '```\n'
+            'Chân số 2 và 3 bị tráo đổi giữa CTIA & OMTP!\n'
+            '```\n\n'
+            '**Sau**\n'
+        )
+        updated, spans = app.prepare_diagram_replacements(material)
+        self.assertNotIn('```', updated)
+        self.assertEqual(len(spans), 1)
+        self.assertIn('CTIA', spans[0][2])
+        self.assertIn('OMTP', spans[0][2])
+        self.assertIn('[ Tip:', spans[0][2])
+        self.assertIn('Tip    Ring 1', spans[0][2])
+        start, end, _text = spans[0]
+        replaced = updated[:start] + '\n\n![Sơ đồ](https://cret.example/a.jpg)\n\n' + updated[end:]
+        self.assertNotIn('```', replaced)
+        self.assertNotIn('[ Tip:', replaced)
+        self.assertIn('Chân số 2 và 3', replaced)
+        self.assertIn('**Sau**', replaced)
+        self.assertLess(replaced.index('![Sơ đồ]'), replaced.index('Chân số 2 và 3'))
+
+    def test_table_and_python_fence_are_not_diagrams(self):
+        table = '| Tên                  | Giá      |\n| -------------------- | -------- |\n| DAC                  | 32-bit   |\n'
+        code = '```python\ndef f() -> int:\n    return 1\n```\n'
+        updated, spans = app.prepare_diagram_replacements(table + '\n' + code)
+        self.assertEqual(spans, [])
+        self.assertIn('| Tên', updated)
+        self.assertIn('```python', updated)
 
     async def test_generated_ascii_image_replaces_the_fence(self):
         material = '# Bài\n\n```\n┌──┐\n│A │\n└──┘\n```\n\n### Còn lại\n\n**Không** bị nuốt.\n'

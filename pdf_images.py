@@ -6,6 +6,7 @@ large unique raster, or a scanned page becomes an image. Everything extracted
 here is kept; the caller does not rank or drop it.
 """
 
+import json
 import re
 
 import pymupdf
@@ -165,7 +166,17 @@ def content_images(page, band, rasters, page_number):
 
 
 def figure_clip(page, caption, previous_bottom, rasters, page_number):
+    # Table captions are often close to a figure. Never consume their cells into
+    # the figure crop, or they disappear from the ground-truth text.
+    table_rects = []
+    try:
+        table_rects = [pymupdf.Rect(table.bbox) for table in page.find_tables().tables]
+    except Exception:
+        pass
     band_top = max(HEADER_BOTTOM, previous_bottom)
+    for rect in table_rects:
+        if rect.y1 < caption['bbox'].y0 and rect.y1 > band_top:
+            band_top = rect.y1
     band = pymupdf.Rect(CONTENT_X0, band_top + 1, page.rect.width - CONTENT_X0, caption["bbox"].y1 + 2)
     drawings = intersecting_drawings(page, band)
     images = content_images(page, band, rasters, page_number)
@@ -252,6 +263,30 @@ def page_body(page, figures):
     return "\n".join(parts).strip()
 
 
+def page_tables(page, figures):
+    """Supplement reading-order text with extracted table rows; extraction may be imperfect."""
+    try:
+        tables = page.find_tables().tables
+    except Exception:
+        return ''
+    result = []
+    for table in tables:
+        bbox = pymupdf.Rect(table.bbox)
+        if any(figure.get('clip') and bbox.intersects(figure['clip']) for figure in figures):
+            continue
+        try:
+            rows = [[page.get_textbox(pymupdf.Rect(cell)).strip() if cell else ''
+                     for cell in row.cells] for row in table.rows]
+        except Exception:
+            continue
+        if len(rows) < 2 or max((len(row) for row in rows), default=0) < 2:
+            continue
+        result.append('Bảng trích xuất tự động (kiểm tra vị trí ô với PDF gốc):\n' +
+                      '\n'.join(json.dumps([str(cell).strip() if cell is not None else '' for cell in row],
+                                           ensure_ascii=False) for row in rows))
+    return '\n\n'.join(result)
+
+
 def digital_page(doc, page, page_number, rasters, next_id):
     captions = []
     for line in lines_of(page):
@@ -296,7 +331,9 @@ def digital_page(doc, page, page_number, rasters, next_id):
         })
         used.add(raster["xref"])
     figures.sort(key=lambda figure: figure["clip"].y0)
-    return page_body(page, figures), figures, next_id
+    body = page_body(page, figures)
+    tables = page_tables(page, figures)
+    return body + ('\n\n' + tables if tables else ''), figures, next_id
 
 
 def extract(path):
@@ -314,13 +351,13 @@ def extract(path):
                 caption = f"Trang {index + 1}"
                 figures.append({"id": figure_id, "bytes": render_page(page), "caption": caption})
                 text = ocr_text(page) or page.get_text("text").strip()
-                chunks.append(f"[[fig:{figure_id}]]\n{caption}" + (f"\n{text}" if text else ""))
+                chunks.append(f"[Trang PDF {index + 1}]\n[[fig:{figure_id}]]\n{caption}" + (f"\n{text}" if text else "\n[Không trích xuất được văn bản OCR; kiểm tra ảnh trang gốc.]"))
                 continue
             text, page_figures, next_id = digital_page(doc, page, index + 1, rasters, next_id)
             figures.extend({"id": figure["id"], "bytes": figure["bytes"], "caption": figure["caption"]}
                            for figure in page_figures)
             if text:
-                chunks.append(text)
+                chunks.append(f'[Trang PDF {index + 1}]\n{text}')
         return "\n\n".join(chunks).strip(), figures
     finally:
         doc.close()

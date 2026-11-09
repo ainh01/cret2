@@ -92,6 +92,12 @@ shared = []
 
 async def fake_ai_call(user_message, images=None):
     calls.append({'message': user_message, 'images': images})
+    if user_message.startswith('STAGE: KNOWLEDGE'):
+        return json.dumps({'concepts': [{'concept': 'chủ đề', 'details': 'chi tiết',
+                                       'evidence': 'general knowledge', 'location': 'not supplied'}],
+                           'uncertainties': [], 'outline': ['Bài học']})
+    if user_message.startswith('STAGE: SOURCE REVIEW'):
+        return json.dumps({'material': 'nội dung', 'questions': []})
     return '```material\nnội dung\nendmaterial```'
 
 
@@ -130,7 +136,7 @@ with patch.object(app, 'load_config', return_value=MATERIAL_ONLY_CONFIG), \
     run_generate({'input': 'đề bài',
                   'sources': [{'name': 'a.docx', 'text': 'NGUỒN A'},
                               {'name': 'b.mp3', 'text': 'NGUỒN B'}]})
-    assert 'đề bài\n\nNGUỒN A\n\nNGUỒN B' in calls[0]['message']
+    assert 'đề bài\n\nNguồn: a.docx\n\nNGUỒN A\n\nNguồn: b.mp3\n\nNGUỒN B' in calls[0]['message']
     assert not calls[0]['images']
 
     # Plain data URLs and OpenAI-style content parts are both accepted.
