@@ -388,11 +388,15 @@ def figure_payload(figures):
             mime = "image/jpeg"
         else:
             mime = "image/png"
-        images.append({
+        item = {
             "id": figure["id"],
             "caption": figure.get("caption") or "",
             "data_url": "data:" + mime + ";base64," + base64.b64encode(data).decode("ascii"),
-        })
+        }
+        if figure.get('page') is not None:
+            item['page'] = figure['page']
+            item['bbox'] = figure.get('bbox')
+        images.append(item)
     return images
 
 
@@ -453,6 +457,7 @@ async def convert_attachment(file: UploadFile | None = File(None), url: str | No
     if has_file == has_url:
         raise HTTPException(400, 'Hãy chọn một tệp hoặc dán một liên kết YouTube.')
     figures = []
+    evidence = []
 
     if has_file:
         data = await file.read()
@@ -467,7 +472,7 @@ async def convert_attachment(file: UploadFile | None = File(None), url: str | No
             figures = []
             try:
                 if pdf_images.is_pdf(path, path.name):
-                    text, figures = await asyncio.to_thread(convert_pdf, str(path))
+                    text, figures, evidence = await asyncio.to_thread(pdf_images.extract, str(path), True)
                 else:
                     text = await asyncio.to_thread(convert_upload, str(path))
             except Exception as exc:
@@ -499,6 +504,9 @@ async def convert_attachment(file: UploadFile | None = File(None), url: str | No
     payload = {'text': text or ''}
     if figures:
         payload['images'] = figure_payload(figures)
+    if evidence:
+        payload['evidence'] = [{'page': item['page'], 'caption': item['caption'],
+                                'data_url': bytes_data_url(item['bytes'])} for item in evidence]
     return payload
 
 
@@ -904,6 +912,14 @@ class FigureIn(BaseModel):
     id: str = Field(default='', max_length=40)
     caption: str = Field(default='', max_length=500)
     data_url: str = Field(min_length=1, max_length=MAX_REQUEST_BYTES)
+    page: int | None = Field(default=None, ge=1)
+    bbox: list[float] | None = Field(default=None, min_length=4, max_length=4)
+
+
+class EvidencePage(BaseModel):
+    page: int = Field(ge=1)
+    caption: str = Field(default='', max_length=500)
+    data_url: str = Field(min_length=1, max_length=MAX_REQUEST_BYTES)
 
 
 class OrderedPart(BaseModel):
@@ -914,6 +930,7 @@ class OrderedPart(BaseModel):
     text: str = Field(default='', max_length=MAX_CONVERT_TEXT_CHARS)
     data_url: str = Field(default='', max_length=MAX_REQUEST_BYTES)
     images: list[FigureIn] = Field(default_factory=list)
+    evidence: list[EvidencePage] = Field(default_factory=list, max_length=20)
 
     @field_validator('kind')
     @classmethod
@@ -1026,8 +1043,11 @@ def assemble_parts(user_input, parts):
     if (user_input or '').strip():
         chunks.append(user_input.strip())
     records = []
+    evidence_records = []
     number = 1
-    for part in parts:
+    MAX_EVIDENCE_PAGES = 20
+    evidence_count = 0
+    for part_index, part in enumerate(parts, 1):
         if part.kind == 'image':
             data, mime = decode_image_data_url(part.data_url)
             label = f'Image #{number}'
@@ -1047,15 +1067,32 @@ def assemble_parts(user_input, parts):
             else:
                 text = (text.rstrip() + '\n\n' + marker).strip()
             records.append({'number': number, 'label': label,
-                            'caption': figure.caption or label, 'data': data, 'mime': mime})
+                            'caption': figure.caption or label, 'data': data, 'mime': mime,
+                            'page': figure.page, 'bbox': figure.bbox})
             number += 1
+        missing_pages = []
+        for page in part.evidence:
+            if evidence_count >= MAX_EVIDENCE_PAGES:
+                missing_pages.append(str(page.page))
+                continue
+            data, mime = decode_image_data_url(page.data_url)
+            label = f'Doc {part_index} - PDF page {page.page}'
+            evidence_records.append({'label': label, 'caption': page.caption or label,
+                                     'data': data, 'mime': mime})
+            evidence_count += 1
         text = text.strip()
+        if part.evidence:
+            source_label = (part.name or '').strip() or f'Tài liệu {part_index}'
+            text = f'[Ảnh trang nguồn Doc {part_index}: {source_label}]\n\n' + text
+        if missing_pages:
+            text += ('\n[Không kèm ảnh các trang PDF do giới hạn ảnh nguồn: ' +
+                     ', '.join(missing_pages) + '; cần kiểm tra PDF gốc.]')
         if text:
             name = (part.name or '').strip()
             chunks.append(f'Nguồn: {name}\n\n{text}' if name else text)
     if len(records) > MAX_DOCUMENT_IMAGES:
         raise HTTPException(422, f'Tối đa {MAX_DOCUMENT_IMAGES} ảnh.')
-    return '\n\n'.join(chunks), records
+    return '\n\n'.join(chunks), records, evidence_records
 
 
 # ---------------------------------------------------------------- optional illustration
@@ -1107,19 +1144,19 @@ async def illustration_plan(material):
     choices = '\n'.join(f'{index} [heading: {heading or "(none)"}]: {text[:350]}'
                         for index, (_, text, heading) in enumerate(sections))
     prompt = (
-        'You are an expert educational visual designer. Read the learning material below and plan '
-        f'up to {MAX_ILLUSTRATIONS} distinct illustrations, ideally one per meaningful section. '
-        'For a multi-section lesson choose multiple distinct paragraphs spread across its sections; '
-        'for a short lesson choose fewer. Only illustrate where an image genuinely clarifies a concept. '
-        'Each illustration must have its own precise image prompt grounded in that paragraph and '
-        'the surrounding context, including actual concepts, entities, relationships and quantities. '
-        'Use clear composition, factual accuracy, appropriate visual metaphors and meaningful '
-        'labels only when essential; no decoration, unrelated details, watermarks or invented facts. '
-        'Avoid illegible text and formulas; favor explanatory visual structure. Do not rewrite the material. '
-        'Return ONLY a JSON array of objects with keys "section" (distinct integer from the numbered '
-        'paragraphs), "prompt" (detailed English visual instructions) and "alt" (brief Vietnamese '
-        'description). Choose only sections from the list; do not duplicate a section.\n\n'
-        'NUMBERED PARAGRAPHS:\n' + choices + '\n\nMATERIAL CONTEXT:\n' + material[:16000]
+        'Bạn là chuyên gia thiết kế hình minh họa giáo dục. Đọc học liệu dưới đây và lập kế hoạch '
+        f'tối đa {MAX_ILLUSTRATIONS} hình minh họa khác nhau, ưu tiên các phần có ý nghĩa. '
+        'Với bài nhiều phần, chọn nhiều đoạn khác nhau trải đều; bài ngắn thì chọn ít hơn. '
+        'Chỉ minh họa khi hình thực sự làm rõ khái niệm. Mỗi mô tả ảnh phải viết bằng tiếng Việt, '
+        'nêu chính xác các khái niệm, đối tượng, quan hệ và số lượng theo đoạn và ngữ cảnh. '
+        'Bố cục rõ ràng, đúng kiến thức, chỉ thêm nhãn khi cần; không trang trí, bịa thông tin '
+        'hoặc thêm dấu bản quyền. Mọi chữ hiện trong ảnh, bao gồm tiêu đề, chú thích và nhãn, '
+        'phải bằng tiếng Việt có dấu; giữ nguyên công thức, biến và ký hiệu chuyên môn cần thiết. '
+        'Tránh công thức hoặc chữ khó đọc. Không viết lại học liệu. '
+        'Chỉ trả về mảng JSON với các khóa "section" (số nguyên đoạn), '
+        '"prompt" (hướng dẫn chi tiết bằng tiếng Việt) và "alt" (mô tả ngắn bằng tiếng Việt). '
+        'Chỉ chọn đoạn có trong danh sách, không lặp lại.\n\n'
+        'CÁC ĐOẠN ĐÁNH SỐ:\n' + choices + '\n\nNGỮ CẢNH HỌC LIỆU:\n' + material[:16000]
     )
     reply = (await ai_call(prompt)).strip()
     try:
@@ -1158,7 +1195,7 @@ def fallback_illustration_plans(sections):
     """Still call the image API when the planner reply is unusable."""
     result = []
     for end, text, heading in sections[:MAX_ILLUSTRATIONS]:
-        result.append((end, 'Clear educational diagram of: ' + text[:800], heading or 'Minh họa'))
+        result.append((end, 'Vẽ sơ đồ giáo dục rõ ràng về: ' + text[:800], heading or 'Minh họa'))
     return result
 
 
@@ -1271,7 +1308,10 @@ async def generate_and_insert(material, prompts, public_base_url, replace):
     async def generate_one(item):
         async with semaphore:
             try:
-                return await generated_image_bytes(item[2])
+                prompt = ('Tạo hình minh họa giáo dục theo nội dung dưới đây. Mọi chữ xuất hiện '
+                          'trong ảnh, kể cả tiêu đề, nhãn và chú thích, phải bằng tiếng Việt có dấu. '
+                          'Giữ nguyên công thức, biến, ký hiệu và tên riêng chuyên môn cần thiết.\n\n' + item[2])
+                return await generated_image_bytes(prompt)
             except Exception as exc:
                 print(f'[minh họa] bỏ một ảnh: {exc.__class__.__name__}: {exc}', file=sys.stderr)
                 return exc
@@ -1850,7 +1890,11 @@ GROUNDING_POLICY = (
     'If only a topic is supplied, create a useful general lesson, do not pretend the topic is '
     'an evidential document and do not invent citations. PDF page numbers are viewer page '
     'numbers unless explicitly stated otherwise; extracted tables and OCR may contain errors. '
-    'When images are provided, use their visible contents as evidence without guessing illegible details.'
+    'When images are provided, use their visible contents as evidence without guessing illegible details. '
+    'Images stamped Doc N - PDF page are source-only page renders for the matching Doc N source, '
+    'not numbered figures for publication. '
+    'Text extraction can omit or corrupt formulas or symbols; do not mistake such omissions for '
+    'missing content in the original page. Check the page image when available.'
 )
 
 
@@ -2010,7 +2054,8 @@ async def review_material_and_quiz(context, schema, material, questions, images)
 
 
 async def run_pipeline(queue, user_input, reference='', images=None, question_count=6,
-                       generate_illustration=False, public_base_url='', document_images=None):
+                       generate_illustration=False, public_base_url='', document_images=None,
+                       evidence_images=None):
     cfg = load_config()
     user_input = user_input or ''
     images = list(images or [])
@@ -2025,7 +2070,8 @@ async def run_pipeline(queue, user_input, reference='', images=None, question_co
     steps = cfg['steps']
     # All source images are available to creation and review, not just the first call.
     document_parts = stamped_image_parts(document_images) if document_images else None
-    source_images = document_parts if document_parts is not None else (images or None)
+    evidence_parts = stamped_image_parts(evidence_images or [])
+    source_images = (list(document_parts or images or []) + evidence_parts) or None
 
     def step_images(name):
         return source_images
@@ -2132,13 +2178,14 @@ async def validation_handler(request, exc):
 async def generate(request: Request, body: GenerateRequest | None = None):
     body = body or GenerateRequest()
     if body.parts:
-        material_input, document_images = assemble_parts(body.input or '', body.parts)
+        material_input, document_images, evidence_images = assemble_parts(body.input or '', body.parts)
         image_payload = []
     else:
         sources, images = validate_attachments(body)
         source_payload = [{'name': source.name, 'text': source.text} for source in sources]
         image_payload = [part.model_dump() for part in images]
         document_images = []
+        evidence_images = []
         # Converted attachments land after the typed input, as extra source material.
         material_input = join_source(body.input or '', source_payload)
     if len(material_input) > MAX_INPUT_CHARS:
@@ -2148,9 +2195,11 @@ async def generate(request: Request, body: GenerateRequest | None = None):
 
     async def produce():
         try:
+            kwargs = {'document_images': document_images}
+            if evidence_images:
+                kwargs['evidence_images'] = evidence_images
             link = await run_pipeline(queue, material_input, body.reference or '', image_payload,
-                                      body.question_count, body.generate_illustration, public_base_url,
-                                      document_images=document_images)
+                                      body.question_count, body.generate_illustration, public_base_url, **kwargs)
             await queue.put({'done': True, 'link': link})
         except PipelineError as exc:
             await queue.put({'error': str(exc)})

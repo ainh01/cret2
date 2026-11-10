@@ -345,7 +345,8 @@
         }
         const figures = converted.images || [];
         imageCount += figures.length;
-        parts.push({ kind: 'source', name: item.name, text: converted.text || '', images: figures });
+        parts.push({ kind: 'source', name: item.name, text: converted.text || '', images: figures,
+                     evidence: converted.evidence || [] });
       }
       if (imageCount > 40) {
         throw new Error('Tối đa 40 ảnh.');

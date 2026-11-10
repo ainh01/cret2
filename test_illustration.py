@@ -49,6 +49,7 @@ class IllustrationTests(unittest.IsolatedAsyncioTestCase):
             payload = json.loads(request.content)
             self.assertEqual(payload['model'], 'image-model')
             self.assertIn('cell', payload['prompt'])
+            self.assertIn('phải bằng tiếng Việt có dấu', payload['prompt'])
             return httpx.Response(200, json={'data': [{'b64_json': base64.b64encode(PNG).decode()}]})
 
         with tempfile.TemporaryDirectory() as tmp, \
@@ -79,7 +80,8 @@ class IllustrationTests(unittest.IsolatedAsyncioTestCase):
                         self.assertEqual(image.headers['access-control-allow-origin'], '*')
                         self.assertEqual((await client.get('/generated-images/../../secret')).status_code, 404)
                         self.assertEqual(len(calls), 7)
-                        self.assertIn('factual accuracy', calls[-1])
+                        self.assertIn('đúng kiến thức', calls[-1])
+                        self.assertIn('phải bằng tiếng Việt có dấu', calls[-1])
 
     async def test_multiple_images_and_failure_cleanup(self):
         material = ('# Giới thiệu\n\nĐây là nội dung đầu tiên về tế bào và cấu trúc.\n\n'
@@ -92,7 +94,7 @@ class IllustrationTests(unittest.IsolatedAsyncioTestCase):
         ]
         calls = []
         async def fake_ai(prompt):
-            self.assertIn('up to 8 distinct illustrations', prompt)
+            self.assertIn('tối đa 8 hình minh họa', prompt)
             self.assertIn('heading: Phần hai', prompt)
             return json.dumps(plans)
         async def fake_generate(prompt):
@@ -109,7 +111,7 @@ class IllustrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertGreater(result.index('Phát triển]'), result.index('## Phần ba'))
 
         async def failing_generate(prompt):
-            if prompt == 'function':
+            if prompt.endswith('function'):
                 raise app.PipelineError('provider error')
             return PNG, 'png'
         with tempfile.TemporaryDirectory() as tmp, patch.object(app, 'IMAGE_DIR', Path(tmp)), \
@@ -118,6 +120,20 @@ class IllustrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result.count('!['), 2)
             self.assertNotIn('Chức năng]', result)
             self.assertEqual(len(list(Path(tmp).iterdir())), 2)
+
+    async def test_fallback_prompt_requests_vietnamese(self):
+        async def bad_plan(_prompt):
+            return 'invalid JSON'
+        seen = []
+        async def fake_generate(prompt):
+            seen.append(prompt)
+            return PNG, 'png'
+        with tempfile.TemporaryDirectory() as tmp, patch.object(app, 'IMAGE_DIR', Path(tmp)), \
+             patch.object(app, 'ai_call', bad_plan), patch.object(app, 'generated_image_bytes', fake_generate):
+            result = await app.add_illustration('Đây là một đoạn kiến thức dài về tế bào.', 'https://cret.example')
+        self.assertIn('Vẽ sơ đồ giáo dục', seen[0])
+        self.assertIn('phải bằng tiếng Việt có dấu', seen[0])
+        self.assertIn('![', result)
 
     async def test_reject_invalid_illustration_plans(self):
         material = 'Đây là một đoạn kiến thức dài và có nội dung rõ ràng.\n'
@@ -366,6 +382,7 @@ class IllustrationTests(unittest.IsolatedAsyncioTestCase):
         material = '# Bài\n\n```\n┌──┐\n│A │\n└──┘\n```\n\n### Còn lại\n\n**Không** bị nuốt.\n'
         async def fake_generate(prompt):
             self.assertIn('┌', prompt)
+            self.assertIn('phải bằng tiếng Việt có dấu', prompt)
             return PNG, 'jpg'
         with tempfile.TemporaryDirectory() as tmp, patch.object(app, 'IMAGE_DIR', Path(tmp)), \
              patch.object(app, 'generated_image_bytes', fake_generate):

@@ -53,7 +53,8 @@ with tempfile.TemporaryDirectory() as tmp:
     assert body['images'][0]['data_url'].startswith('data:image/png;base64,')
     scan = client.post('/api/convert', files={'file': ('scan.pdf', scan_path.read_bytes(), 'application/pdf')})
     assert scan.status_code == 200, scan.text
-    assert len(scan.json()['images']) == 1, scan.text
+    assert not scan.json().get('images'), scan.text
+    assert len(scan.json()['evidence']) == 1, scan.text
 
 
 MATERIAL = '# Sơ đồ\n\nĐây là đoạn giải thích đủ dài về sơ đồ khối và đường tín hiệu.\n'
