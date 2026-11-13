@@ -80,14 +80,40 @@ class GroundingTests(unittest.IsolatedAsyncioTestCase):
                 await app.run_pipeline(asyncio.Queue(), SOURCE, question_count=1)
             share.assert_not_called()
 
-    async def test_invalid_schema_prevents_publication(self):
-        async def bad_schema(prompt, images=None):
-            return json.dumps({'concepts': [], 'uncertainties': [], 'outline': ['x']})
-        with patch.object(app, 'load_config', return_value=CONFIG), patch.object(app, 'ai_call', bad_schema), \
+    def test_schema_json_repaired_locally(self):
+        malformed = json.dumps(SCHEMA)[:-1] + ',}'
+        self.assertEqual(app.schema_from_reply(malformed), SCHEMA)
+
+    def test_schema_invalid_falls_back_to_raw_text(self):
+        self.assertEqual(app.schema_from_reply('{not valid json'), '{not valid json')
+
+    def test_schema_fenced_json_stripped(self):
+        self.assertEqual(app.schema_from_reply('```json\n' + json.dumps(SCHEMA) + '\n```'), SCHEMA)
+
+    async def test_invalid_schema_json_does_not_block_publication(self):
+        captured = []
+
+        async def fake_ai(prompt, images=None):
+            captured.append(prompt)
+            if prompt.startswith('STAGE: KNOWLEDGE'):
+                return '{not valid json'
+            if prompt.startswith('STAGE: CREATE'):
+                return '```material\nDraft\nendmaterial```'
+            if prompt.startswith('ENRICH'):
+                return '```material\nEnriched\nendmaterial```'
+            if prompt.startswith('Generate'):
+                return '```quiz\n' + json.dumps([QUESTION]) + '\nendquiz```'
+            if prompt.startswith('STAGE: SOURCE REVIEW MATERIAL'):
+                return material_review('Final lesson')
+            if prompt.startswith('STAGE: SOURCE REVIEW QUIZ'):
+                return quiz_review([QUESTION])
+            self.fail('Unexpected prompt')
+
+        with patch.object(app, 'load_config', return_value=CONFIG), patch.object(app, 'ai_call', fake_ai), \
              patch.object(app, 'share_state') as share:
-            with self.assertRaisesRegex(app.PipelineError, 'Sơ đồ kiến thức'):
-                await app.run_pipeline(asyncio.Queue(), SOURCE, question_count=1)
-            share.assert_not_called()
+            await app.run_pipeline(asyncio.Queue(), SOURCE, question_count=1)
+        share.assert_called_once()
+        self.assertIn('{not valid json', captured[1])
 
     async def test_legacy_image_visible_in_every_source_stage(self):
         seen = []

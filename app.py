@@ -1898,18 +1898,25 @@ GROUNDING_POLICY = (
 )
 
 
-def parse_json_object(reply, stage):
+def schema_from_reply(reply):
+    """Locally repair the knowledge-schema reply; fall back to raw text when unparseable.
+
+    The schema is only fed back to the next AI stage as guidance, so a non-JSON reply is
+    acceptable — it must never fail the run.
+    """
     text = (reply or '').strip()
     if text.startswith('```'):
         text = re.sub(r'^```(?:json)?\s*', '', text, count=1, flags=re.IGNORECASE)
         text = re.sub(r'\s*```\s*$', '', text, count=1)
     try:
-        result = json.loads(text)
-    except (ValueError, TypeError) as exc:
-        raise PipelineError(f'{stage}: phản hồi JSON không hợp lệ; chưa chia sẻ bài.') from exc
-    if not isinstance(result, dict):
-        raise PipelineError(f'{stage}: phản hồi không phải đối tượng JSON; chưa chia sẻ bài.')
-    return result
+        return parse_possibly_broken_json(text)
+    except ValueError:
+        return text
+
+
+def schema_text(schema):
+    """Render the schema for inclusion in the next prompt, JSON or raw text alike."""
+    return schema if isinstance(schema, str) else json.dumps(schema, ensure_ascii=False)
 
 
 def source_context(user_input, reference_material):
@@ -1939,16 +1946,7 @@ async def make_knowledge_schema(context, images):
         'source image and visible evidence. If no source is provided use "general knowledge" '
         'as evidence and "not supplied" as location. Do not invent quotes or locations.\n\n' + context
     )
-    schema = parse_json_object(await ai_call(prompt, images), 'Sơ đồ kiến thức')
-    concepts, uncertainties, outline = schema.get('concepts'), schema.get('uncertainties'), schema.get('outline')
-    if (not isinstance(concepts, list) or not concepts or not isinstance(uncertainties, list)
-            or not all(isinstance(x, str) for x in uncertainties) or not isinstance(outline, list)
-            or not outline or not all(isinstance(x, str) and x.strip() for x in outline)):
-        raise PipelineError('Sơ đồ kiến thức thiếu nội dung hoặc dàn ý; chưa chia sẻ bài.')
-    for item in concepts:
-        if not isinstance(item, dict) or any(not isinstance(item.get(key), str) or not item[key].strip()
-                                             for key in ('concept', 'details', 'evidence', 'location')):
-            raise PipelineError('Sơ đồ kiến thức thiếu bằng chứng hoặc vị trí; chưa chia sẻ bài.')
+    schema = schema_from_reply(await ai_call(prompt, images))
     return schema
 
 
@@ -1956,11 +1954,11 @@ async def create_material(context, schema, images):
     prompt = ('STAGE: CREATE MATERIAL\n' + GROUNDING_POLICY +
               '\nCreate a complete, clear Vietnamese lesson from the knowledge map and outline. '
               'Consult the original source, not only the map. Explain from first principles; '
-              'preserve the evidence and distinctions in the source. For source-specific facts, '
-              'include useful source locations, e.g. the actual PDF viewer page and figure or table '
-              'identifier when available; never invent a location. Do not write image markdown. '
+              'preserve the evidence and distinctions in the source. Do not include source '
+              'locations, page numbers, figure or table identifiers, citations, or credit '
+              'references in the lesson. Do not write image markdown. '
               'Return only the lesson in a ```material block ending with endmaterial```.\n\n'
-              'KNOWLEDGE MAP AND OUTLINE:\n' + json.dumps(schema, ensure_ascii=False) + '\n\n' + context)
+              'KNOWLEDGE MAP AND OUTLINE:\n' + schema_text(schema) + '\n\n' + context)
     reply = await ai_call(prompt, images)
     extracted = extract_block(reply, '```material', 'endmaterial```')
     return require_nonempty_text(extracted if extracted is not None else reply, 'Tạo học liệu')
@@ -2010,13 +2008,13 @@ async def review_response(prompt, images, parse, stage):
 async def review_material_and_quiz(context, schema, material, questions, images):
     evidence = ('\n\nORIGINAL SOURCE:\n' + context +
                 '\n\nKNOWLEDGE MAP (may contain errors, verify against original):\n' +
-                json.dumps(schema, ensure_ascii=False))
+                schema_text(schema))
     material_prompt = ('STAGE: SOURCE REVIEW MATERIAL\n' + GROUNDING_POLICY +
                        '\nIndependently review EVERY substantive claim against the original source '
                        'and source images, not merely the draft or knowledge map. Correct errors, '
                        'preserve numerical conditions and valid coverage, and remove or qualify '
                        'unsupported claims and guarantees. Explain source conflicts and uncertainty; '
-                       'keep or correct source locations without inventing citations. Keep valid '
+                       'remove source locations, page numbers, citations, and credit references. Keep valid '
                        'image markdown and interactive blocks unchanged. When no external source '
                        'was provided, check general reasoning and do not claim document verification. '
                        'Return the COMPLETE corrected lesson as ordinary Markdown, NOT JSON. '
@@ -2089,7 +2087,7 @@ async def run_pipeline(queue, user_input, reference='', images=None, question_co
                   'STAGE: ENRICH THE EXISTING DRAFT\n' + GROUNDING_POLICY +
                   '\nEnrich the draft, not the raw source. Preserve its facts and coverage; '
                   'use the source to check every added detail.\n\nDRAFT:\n' + draft +
-                  '\n\nKNOWLEDGE MAP:\n' + json.dumps(schema, ensure_ascii=False) +
+                  '\n\nKNOWLEDGE MAP:\n' + schema_text(schema) +
                   '\n\nORIGINAL SOURCE:\n' + context)
         reply = await ai_call(prompt, step_images('material'))
         extracted = extract_block(reply, '```material', 'endmaterial```')
