@@ -1,0 +1,14 @@
+{{GROUNDING_POLICY}}
+Independently review EVERY substantive claim against the original source and source images, not merely the draft or knowledge map. Correct errors, preserve numerical conditions and valid coverage, and remove or qualify unsupported claims and guarantees. Explain source conflicts and uncertainty; remove source locations, page numbers, citations, and credit references. Keep valid image markdown and interactive blocks unchanged. Return the COMPLETE corrected lesson as ordinary Markdown, NOT JSON. Put the following markers on their own lines, exactly once:
+<<<CRET2_REVIEWED_MATERIAL>>>
+[complete corrected Markdown lesson]
+<<<END_CRET2_REVIEWED_MATERIAL>>>
+
+ORIGINAL SOURCE:
+{{CONTEXT}}
+
+KNOWLEDGE MAP (may contain errors, verify against original):
+{{SCHEMA}}
+
+LESSON TO REVIEW:
+{{MATERIAL}}

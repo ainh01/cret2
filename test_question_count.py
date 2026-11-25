@@ -17,6 +17,10 @@ def question(index):
     }
 
 
+
+def match(text, prompt):
+    return text.lower() in (prompt or '').lower()
+
 class QuestionCountTests(unittest.TestCase):
     def setUp(self):
         self.client = TestClient(app.app)
@@ -40,9 +44,9 @@ class QuestionCountTests(unittest.TestCase):
 
         async def fake_ai(prompt, images=None):
             self.prompts.append(prompt)
-            if prompt.startswith('STAGE: SOURCE REVIEW MATERIAL'):
+            if match('independently review every substantive', prompt):
                 return app.REVIEW_MATERIAL_BEGIN + '\nđề bài\n' + app.REVIEW_MATERIAL_END
-            if prompt.startswith('STAGE: SOURCE REVIEW QUIZ'):
+            if match('independently review every quiz', prompt):
                 return app.REVIEW_QUIZ_BEGIN + '\n' + json.dumps(generated) + '\n' + app.REVIEW_QUIZ_END
             data = self.responses.pop(0)
             generated[:] = [question(i) for i in range(data)]
@@ -69,7 +73,7 @@ class QuestionCountTests(unittest.TestCase):
         self.assertTrue(events[-1]['done'])
         self.assertEqual(len(self.saved[-1]['questions']), 3)
         self.assertTrue(any('Generate 3 questions. Custom instructions.' in prompt for prompt in self.prompts))
-        quiz_prompt = next(prompt for prompt in reversed(self.prompts) if prompt.startswith('Generate'))
+        quiz_prompt = next(prompt for prompt in reversed(self.prompts) if match('Generate', prompt))
         self.assertNotIn('Generate 6 questions', quiz_prompt)
 
     def test_wrong_count_is_retried_and_not_published(self):

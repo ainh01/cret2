@@ -14,6 +14,10 @@ PNG = b'\x89PNG\r\n\x1a\n' + b'test image bytes'
 MATERIAL = '# Bài học\n\nĐây là đoạn kiến thức rất quan trọng về tế bào.\n\n```interactive\nSome code that should not be considered.\n```\n'
 
 
+
+def match(text, prompt):
+    return text.lower() in (prompt or '').lower()
+
 class IllustrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_image_pipeline_and_public_route(self):
         calls, shared, stages = [], [], []
@@ -26,19 +30,19 @@ class IllustrationTests(unittest.IsolatedAsyncioTestCase):
 
         async def fake_ai(prompt, images=None):
             calls.append(prompt)
-            if prompt.startswith('STAGE: KNOWLEDGE'):
+            if match('create full roadmap', prompt):
                 return json.dumps({'concepts': [{'concept': 'cell', 'details': 'structure',
                                                'evidence': 'general knowledge', 'location': 'not supplied'}],
                                    'uncertainties': [], 'outline': ['cell']})
-            if prompt.startswith('STAGE: CREATE') or prompt.startswith('MATERIAL'):
-                return '```material\n' + MATERIAL + 'endmaterial```'
-            if prompt.startswith('Generate'):
-                return '```quiz\n' + json.dumps(quiz) + '\nendquiz```'
-            if prompt.startswith('STAGE: SOURCE REVIEW MATERIAL'):
+            if match('independently review every substantive', prompt):
                 return app.REVIEW_MATERIAL_BEGIN + '\n' + MATERIAL + '\n' + app.REVIEW_MATERIAL_END
-            if prompt.startswith('STAGE: SOURCE REVIEW QUIZ'):
+            if match('independently review every quiz', prompt):
                 return app.REVIEW_QUIZ_BEGIN + '\n' + json.dumps(quiz) + '\n' + app.REVIEW_QUIZ_END
-            return json.dumps([{'section': 0, 'prompt': 'A detailed diagram of a cell', 'alt': 'Sơ đồ tế bào'}])
+            if match('teach full ready', prompt) or match('MATERIAL', prompt):
+                return '```material\n' + MATERIAL + 'endmaterial```'
+            if match('Generate', prompt):
+                return '```quiz\n' + json.dumps(quiz) + '\nendquiz```'
+            return 'SECTION:\n0\nPROMPT:\nA detailed diagram of a cell\nALT:\nSơ đồ tế bào\n'
 
         async def fake_share(config, state):
             shared.append(state)
@@ -49,7 +53,7 @@ class IllustrationTests(unittest.IsolatedAsyncioTestCase):
             payload = json.loads(request.content)
             self.assertEqual(payload['model'], 'image-model')
             self.assertIn('cell', payload['prompt'])
-            self.assertIn('phải bằng tiếng Việt có dấu', payload['prompt'])
+            self.assertIn('DÙNG TIẾNG VIỆT HOÀN TOÀN', payload['prompt'])
             return httpx.Response(200, json={'data': [{'b64_json': base64.b64encode(PNG).decode()}]})
 
         with tempfile.TemporaryDirectory() as tmp, \
@@ -69,7 +73,7 @@ class IllustrationTests(unittest.IsolatedAsyncioTestCase):
                                                                           'browser_base_url': 'https://cret.example.com/prefix'})
                         events = [json.loads(line) for line in response.text.splitlines() if line]
                         self.assertEqual([e['stage'] for e in events if 'stage' in e],
-                                         ['schema', 'draft', 'material', 'quiz', 'verify', 'illustration', 'share'])
+                                         ['schema', 'draft', 'material', 'quiz', 'illustration', 'share'])
                         self.assertTrue(events[-1]['done'])
                         material = shared[-1]['material']
                         self.assertIn('![Sơ đồ tế bào](https://cret.example.com/prefix/generated-images/', material)
@@ -79,24 +83,22 @@ class IllustrationTests(unittest.IsolatedAsyncioTestCase):
                         self.assertEqual(image.content, PNG)
                         self.assertEqual(image.headers['access-control-allow-origin'], '*')
                         self.assertEqual((await client.get('/generated-images/../../secret')).status_code, 404)
-                        self.assertEqual(len(calls), 7)
-                        self.assertIn('đúng kiến thức', calls[-1])
-                        self.assertIn('phải bằng tiếng Việt có dấu', calls[-1])
+                        # schema, draft, material, quiz, planner = 5 (no verify: typed topic only)
+                        self.assertEqual(len(calls), 5)
+                        self.assertIn('Create 8 prompts', calls[-1])
 
     async def test_multiple_images_and_failure_cleanup(self):
         material = ('# Giới thiệu\n\nĐây là nội dung đầu tiên về tế bào và cấu trúc.\n\n'
                     '## Phần hai\n\nĐây là nội dung thứ hai về chức năng của tế bào.\n\n'
                     '## Phần ba\n\nĐây là nội dung thứ ba về sự phát triển của tế bào.\n')
-        plans = [
-            {'section': 2, 'prompt': 'growth', 'alt': 'Phát triển'},
-            {'section': 0, 'prompt': 'structure', 'alt': 'Cấu trúc'},
-            {'section': 1, 'prompt': 'function', 'alt': 'Chức năng'},
-        ]
+        plan_reply = ('SECTION:\n2\nPROMPT:\ngrowth\nALT:\nPhát triển\n\n'
+                      'SECTION:\n0\nPROMPT:\nstructure\nALT:\nCấu trúc\n\n'
+                      'SECTION:\n1\nPROMPT:\nfunction\nALT:\nChức năng\n')
         calls = []
         async def fake_ai(prompt):
-            self.assertIn('tối đa 8 hình minh họa', prompt)
+            self.assertIn('Create 8 prompts', prompt)
             self.assertIn('heading: Phần hai', prompt)
-            return json.dumps(plans)
+            return plan_reply
         async def fake_generate(prompt):
             calls.append(prompt)
             return PNG, 'png'
@@ -131,18 +133,22 @@ class IllustrationTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmp, patch.object(app, 'IMAGE_DIR', Path(tmp)), \
              patch.object(app, 'ai_call', bad_plan), patch.object(app, 'generated_image_bytes', fake_generate):
             result = await app.add_illustration('Đây là một đoạn kiến thức dài về tế bào.', 'https://cret.example')
-        self.assertIn('Vẽ sơ đồ giáo dục', seen[0])
-        self.assertIn('phải bằng tiếng Việt có dấu', seen[0])
+        self.assertIn('Vẽ ảnh cho nội dung sau', seen[0])
+        self.assertIn('DÙNG TIẾNG VIỆT HOÀN TOÀN', seen[0])
         self.assertIn('![', result)
 
     async def test_reject_invalid_illustration_plans(self):
         material = 'Đây là một đoạn kiến thức dài và có nội dung rõ ràng.\n'
-        invalid = [[], [{'section': 0, 'prompt': 'x', 'alt': 'a'}] * 2,
-                   [{'section': 5, 'prompt': 'x', 'alt': 'a'}],
-                   [{'section': 0, 'prompt': '', 'alt': 'a'}]]
+        invalid = [
+            'no markers at all',
+            'SECTION:\n0\nPROMPT:\nx\nALT:\na\n\nSECTION:\n0\nPROMPT:\ny\nALT:\nb\n',
+            'SECTION:\n5\nPROMPT:\nx\nALT:\na\n',
+            'SECTION:\n0\nPROMPT:\n\nALT:\na\n',
+            'SECTION:\n0\nPROMPT:\nx\n',
+        ]
         for plan in invalid:
             async def fake_ai(prompt):
-                return json.dumps(plan)
+                return plan
             with self.subTest(plan=plan), patch.object(app, 'ai_call', fake_ai):
                 with self.assertRaises(app.PipelineError):
                     await app.illustration_plan(material)
@@ -382,7 +388,7 @@ class IllustrationTests(unittest.IsolatedAsyncioTestCase):
         material = '# Bài\n\n```\n┌──┐\n│A │\n└──┘\n```\n\n### Còn lại\n\n**Không** bị nuốt.\n'
         async def fake_generate(prompt):
             self.assertIn('┌', prompt)
-            self.assertIn('phải bằng tiếng Việt có dấu', prompt)
+            self.assertIn('DÙNG TIẾNG VIỆT HOÀN TOÀN', prompt)
             return PNG, 'jpg'
         with tempfile.TemporaryDirectory() as tmp, patch.object(app, 'IMAGE_DIR', Path(tmp)), \
              patch.object(app, 'generated_image_bytes', fake_generate):

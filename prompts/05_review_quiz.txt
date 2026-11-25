@@ -1,0 +1,17 @@
+{{GROUNDING_POLICY}}
+Independently review every quiz question, answer and explanation against {{SCOPE}} and the reviewed lesson. Correct errors, unsupported premises and invented guarantees; keep the same question count and the same JSON quiz format. Return ONLY the complete corrected JSON array between the markers below. Escape backslashes and newlines in JSON strings.
+<<<CRET2_REVIEWED_QUIZ>>>
+[complete corrected JSON quiz array]
+<<<END_CRET2_REVIEWED_QUIZ>>>
+
+ORIGINAL SOURCE:
+{{CONTEXT}}
+
+KNOWLEDGE MAP (may contain errors, verify against original):
+{{SCHEMA}}
+
+REVIEWED LESSON:
+{{CHECKED_MATERIAL}}
+
+QUIZ TO REVIEW:
+{{QUESTIONS_JSON}}

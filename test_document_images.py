@@ -17,6 +17,10 @@ PNG_BYTES = PNG.tobytes('png')
 PNG_URL = 'data:image/png;base64,' + base64.b64encode(PNG_BYTES).decode('ascii')
 
 
+
+def match(text, prompt):
+    return text.lower() in (prompt or '').lower()
+
 def figure_pdf(path):
     doc = pymupdf.open()
     page = doc.new_page()
@@ -63,19 +67,19 @@ calls = []
 
 async def fake_ai(prompt, images=None):
     calls.append({'prompt': prompt, 'images': images})
-    if prompt.startswith('STAGE: KNOWLEDGE'):
+    if match('create full roadmap', prompt):
         return json.dumps({'concepts': [{'concept': 'Sơ đồ', 'details': 'Nguồn có sơ đồ',
                                        'evidence': 'Nguồn có [Image #2] ngay sơ đồ.', 'location': 'a.pdf'}],
                            'uncertainties': [], 'outline': ['Sơ đồ']})
-    if prompt.startswith('STAGE: CREATE'):
+    if match('teach full ready', prompt):
         return '```material\n' + MATERIAL + '\nendmaterial```'
-    if prompt.startswith('HỌC'):
+    if match('HỌC', prompt):
         return '```material\n' + MATERIAL + '\n![bịa](http://evil.example/x.png)\n[Image #1]\nendmaterial```'
-    if prompt.startswith('STAGE: SOURCE REVIEW MATERIAL'):
+    if match('independently review every substantive', prompt):
         return app.REVIEW_MATERIAL_BEGIN + '\n' + MATERIAL + '\n![bịa](http://evil.example/x.png)\n[Image #1]\n' + app.REVIEW_MATERIAL_END
-    if prompt.startswith('STAGE: SOURCE REVIEW QUIZ'):
+    if match('independently review every quiz', prompt):
         return app.REVIEW_QUIZ_BEGIN + '\n' + json.dumps(quiz) + '\n' + app.REVIEW_QUIZ_END
-    if prompt.startswith('Generate'):
+    if match('Generate', prompt):
         return '```quiz\n' + json.dumps(quiz) + '\nendquiz```'
     if 'placement failed' in prompt:
         return json.dumps([{'image': 1, 'section': 0}])

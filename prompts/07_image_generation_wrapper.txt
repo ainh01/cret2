@@ -1,0 +1,3 @@
+Vẽ theo prompt dưới đây. DÙNG TIẾNG VIỆT HOÀN TOÀN.
+
+{{PROMPT}}

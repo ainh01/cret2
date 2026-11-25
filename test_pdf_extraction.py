@@ -12,6 +12,10 @@ import app
 import pdf_images
 
 
+
+def match(text, prompt):
+    return text.lower() in (prompt or '').lower()
+
 class PdfExtractionTests(unittest.TestCase):
     def test_background_does_not_erase_text_and_vector_is_extracted(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -140,11 +144,11 @@ class EvidencePipelineTests(unittest.IsolatedAsyncioTestCase):
         async def fake_ai(prompt, images=None):
             import json
             calls.append(images)
-            if prompt.startswith('STAGE: KNOWLEDGE'):
+            if match('create full roadmap', prompt):
                 return json.dumps(schema)
-            if prompt.startswith('STAGE: SOURCE REVIEW MATERIAL'):
+            if match('independently review every substantive', prompt):
                 return app.REVIEW_MATERIAL_BEGIN + '\nBài học\n' + app.REVIEW_MATERIAL_END
-            if prompt.startswith('STAGE: SOURCE REVIEW QUIZ'):
+            if match('independently review every quiz', prompt):
                 return app.REVIEW_QUIZ_BEGIN + '\n[]\n' + app.REVIEW_QUIZ_END
             return 'Bài học'
         async def share(config, state):

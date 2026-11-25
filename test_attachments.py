@@ -60,6 +60,10 @@ assert client.post('/api/convert', data={'url': 'https://youtu.be/abc123'},
                    files={'file': ('a.txt', b'x')}).status_code == 400
 
 
+
+def match(text, prompt):
+    return text.lower() in (prompt or '').lower()
+
 def failing_link(url):
     raise RuntimeError('Internal youtube error')
 
@@ -92,11 +96,13 @@ shared = []
 
 async def fake_ai_call(user_message, images=None):
     calls.append({'message': user_message, 'images': images})
-    if user_message.startswith('STAGE: KNOWLEDGE'):
-        return json.dumps({'concepts': [{'concept': 'chủ đề', 'details': 'chi tiết',
-                                       'evidence': 'general knowledge', 'location': 'not supplied'}],
-                           'uncertainties': [], 'outline': ['Bài học']})
-    if user_message.startswith('STAGE: SOURCE REVIEW MATERIAL'):
+    if match('create full roadmap', user_message):
+        return 'ROADMAP'
+    if match('teach full ready', user_message) or match('enrich the following draft', user_message):
+        return '```material\nnội dung\nendmaterial```'
+    if match('independently review every quiz', user_message):
+        return app.REVIEW_QUIZ_BEGIN + '\n[]\n' + app.REVIEW_QUIZ_END
+    if match('independently review every', user_message):
         return app.REVIEW_MATERIAL_BEGIN + '\nnội dung\n' + app.REVIEW_MATERIAL_END
     return '```material\nnội dung\nendmaterial```'
 

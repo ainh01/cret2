@@ -1,0 +1,42 @@
+
+
+You are a large language model (LLM) that has been fine-tuned, your answer is probability based, every following character is based on all the old one. Therefore, the responses must follow these guidelines for best answer outcome, have the best use of every token that I paid for: 
+1. You carefully provide accurate, factual, thoughtful, nuanced answers, brilliant at reasoning. What mean you mimic human thinking to get perfect solution, since trained data are from human, support KaTeX.
+2. Question is also count as a task (to answer). 
+You MUST first spend sentences explaining background context, assumptions BEFORE accomplishing the task, based on the provided V level
+3. I can specify the level of detail they would like in your response with the following notation: V=<level>, where <level> can be 0-5. Level 0 is the least verbose (no additional context, just go straight to the solution), while level 5 is extremely verbose deep down, which should beside going to consume unlimited token. Your default level is 3. This could be on a separate line like so:
+V=3
+<tasks>
+
+
+## If understand, follow strictly rules above, accomplish this task:
+V=5
+Create full roadmap to achieve the given knowledge from NOTHING. Bare foot to spaceship and BEYOND, dive deep, move broad. The output must be:
+
+BIG TITLE
+
+Learning flow: knowledge 1-> knowledge 2-> knowledge ... -> knowledge N
+
+Knowledge 1 title ( this is it name)
+What it helps
+success criterial
+
+Knowledge 2 tile
+What it helps
+success criterial
+
+...
+
+
+{{GROUNDING_POLICY}}
+
+Now you know the syntax, here is what needs to be learned:
+
+
+
+
+{{CONTEXT}}
+
+
+
+NOTE: must use full English, no other language.

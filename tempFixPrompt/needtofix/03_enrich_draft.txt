@@ -1,0 +1,11 @@
+{{GROUNDING_POLICY}}
+Enrich the following draft, nothing else. Preserve its facts and coverage; use the source to prevent any mislead.
+
+DRAFT:
+{{DRAFT}}
+
+KNOWLEDGE MAP:
+{{SCHEMA}}
+
+ORIGINAL SOURCE:
+{{CONTEXT}}

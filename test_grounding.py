@@ -30,22 +30,28 @@ def quiz_review(questions):
     return app.REVIEW_QUIZ_BEGIN + '\n' + json.dumps(questions, ensure_ascii=False) + '\n' + app.REVIEW_QUIZ_END
 
 
+
+def match(text, prompt):
+    return text.lower() in (prompt or '').lower()
+
 class GroundingTests(unittest.IsolatedAsyncioTestCase):
     async def test_each_stage_gets_original_and_verified_output_is_shared(self):
         calls, saved = [], []
         async def fake_ai(prompt, images=None):
             calls.append(prompt)
-            if prompt.startswith('STAGE: KNOWLEDGE'):
+            if match('create full roadmap', prompt):
                 return json.dumps(SCHEMA)
-            if prompt.startswith('STAGE: CREATE'):
+            if match('teach full ready', prompt):
                 return '```material\nDraft with 0 ms latency\nendmaterial```'
-            if prompt.startswith('ENRICH'):
+            if match('enrich the following draft', prompt):
                 return '```material\nEnriched with 0 ms latency\nendmaterial```'
-            if prompt.startswith('Generate'):
+            if match('Generate', prompt):
                 return '```quiz\n' + json.dumps([QUESTION]) + '\nendquiz```'
-            if prompt.startswith('STAGE: SOURCE REVIEW MATERIAL'):
+            if match('independently review every quiz', prompt):
+                return quiz_review([QUESTION])
+            if match('independently review every substantive', prompt):
                 return material_review('Corrected: latency is not specified.')
-            if prompt.startswith('STAGE: SOURCE REVIEW QUIZ'):
+            if match('independently review every quiz', prompt):
                 return quiz_review([QUESTION])
             self.fail('Unexpected prompt')
         async def fake_share(config, state):
@@ -67,11 +73,11 @@ class GroundingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_invalid_review_prevents_publication(self):
         async def fake_ai(prompt, images=None):
-            if prompt.startswith('STAGE: KNOWLEDGE'):
+            if match('create full roadmap', prompt):
                 return json.dumps(SCHEMA)
-            if prompt.startswith('STAGE: CREATE') or prompt.startswith('ENRICH'):
+            if match('teach full ready', prompt) or match('enrich the following draft', prompt):
                 return '```material\nDraft\nendmaterial```'
-            if prompt.startswith('Generate'):
+            if match('Generate', prompt):
                 return '```quiz\n' + json.dumps([QUESTION]) + '\nendquiz```'
             return '{bad json'
         with patch.object(app, 'load_config', return_value=CONFIG), patch.object(app, 'ai_call', fake_ai), \
@@ -95,17 +101,17 @@ class GroundingTests(unittest.IsolatedAsyncioTestCase):
 
         async def fake_ai(prompt, images=None):
             captured.append(prompt)
-            if prompt.startswith('STAGE: KNOWLEDGE'):
+            if match('create full roadmap', prompt):
                 return '{not valid json'
-            if prompt.startswith('STAGE: CREATE'):
+            if match('teach full ready', prompt):
                 return '```material\nDraft\nendmaterial```'
-            if prompt.startswith('ENRICH'):
+            if match('enrich the following draft', prompt):
                 return '```material\nEnriched\nendmaterial```'
-            if prompt.startswith('Generate'):
+            if match('Generate', prompt):
                 return '```quiz\n' + json.dumps([QUESTION]) + '\nendquiz```'
-            if prompt.startswith('STAGE: SOURCE REVIEW MATERIAL'):
+            if match('independently review every substantive', prompt):
                 return material_review('Final lesson')
-            if prompt.startswith('STAGE: SOURCE REVIEW QUIZ'):
+            if match('independently review every quiz', prompt):
                 return quiz_review([QUESTION])
             self.fail('Unexpected prompt')
 
@@ -120,14 +126,16 @@ class GroundingTests(unittest.IsolatedAsyncioTestCase):
         image = [{'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,abc'}}]
         async def fake_ai(prompt, images=None):
             seen.append(images)
-            if prompt.startswith('STAGE: KNOWLEDGE'):
+            if match('create full roadmap', prompt):
                 return json.dumps(SCHEMA)
-            if prompt.startswith('STAGE: CREATE') or prompt.startswith('ENRICH'):
+            if match('teach full ready', prompt) or match('enrich the following draft', prompt):
                 return '```material\nDraft\nendmaterial```'
-            if prompt.startswith('Generate'):
+            if match('Generate', prompt):
                 return '```quiz\n' + json.dumps([QUESTION]) + '\nendquiz```'
-            if prompt.startswith('STAGE: SOURCE REVIEW MATERIAL'):
+            if match('independently review every substantive', prompt):
                 return material_review('Draft')
+            if match('independently review every quiz', prompt):
+                return quiz_review([QUESTION])
             return quiz_review([QUESTION])
         async def share(config, state):
             return 'https://example.com/abcdef'
@@ -140,8 +148,10 @@ class GroundingTests(unittest.IsolatedAsyncioTestCase):
     async def test_long_markdown_never_needs_json_escaping(self):
         lesson = '# Công thức\n\n$\\frac{a}{b}$\n\n```interactive\n<div>"A"</div>\n```\n' + ('Dòng dài.\n' * 2000)
         async def fake_ai(prompt, images=None):
-            if prompt.startswith('STAGE: SOURCE REVIEW MATERIAL'):
+            if match('independently review every substantive', prompt):
                 return material_review(lesson)
+            if match('independently review every quiz', prompt):
+                return quiz_review([QUESTION])
             return quiz_review([QUESTION])
         with patch.object(app, 'ai_call', fake_ai):
             reviewed, questions = await app.review_material_and_quiz(SOURCE, SCHEMA, lesson, [QUESTION], None)
@@ -151,7 +161,7 @@ class GroundingTests(unittest.IsolatedAsyncioTestCase):
     async def test_review_retries_missing_marker_and_bad_quiz(self):
         attempts = {'material': 0, 'quiz': 0}
         async def fake_ai(prompt, images=None):
-            if prompt.startswith('STAGE: SOURCE REVIEW MATERIAL'):
+            if match('independently review every substantive', prompt):
                 attempts['material'] += 1
                 return 'truncated' if attempts['material'] == 1 else material_review('Đã sửa.')
             attempts['quiz'] += 1
@@ -164,8 +174,10 @@ class GroundingTests(unittest.IsolatedAsyncioTestCase):
     async def test_quiz_json_repair_reused(self):
         malformed = json.dumps([QUESTION], ensure_ascii=False).replace('"20 mW"}', '"20 mW",}')
         async def fake_ai(prompt, images=None):
-            if prompt.startswith('STAGE: SOURCE REVIEW MATERIAL'):
+            if match('independently review every substantive', prompt):
                 return material_review('Đã sửa.')
+            if match('independently review every quiz', prompt):
+                return quiz_review([QUESTION])
             return app.REVIEW_QUIZ_BEGIN + '\n' + malformed + '\n' + app.REVIEW_QUIZ_END
         with patch.object(app, 'ai_call', fake_ai):
             material, questions = await app.review_material_and_quiz(SOURCE, SCHEMA, 'Bài', [QUESTION], None)
@@ -174,13 +186,13 @@ class GroundingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_bad_review_question_count_does_not_publish(self):
         async def fake_ai(prompt, images=None):
-            if prompt.startswith('STAGE: KNOWLEDGE'):
+            if match('create full roadmap', prompt):
                 return json.dumps(SCHEMA)
-            if prompt.startswith('STAGE: CREATE') or prompt.startswith('ENRICH'):
+            if match('teach full ready', prompt) or match('enrich the following draft', prompt):
                 return '```material\nDraft\nendmaterial```'
-            if prompt.startswith('Generate'):
+            if match('Generate', prompt):
                 return '```quiz\n' + json.dumps([QUESTION]) + '\nendquiz```'
-            if prompt.startswith('STAGE: SOURCE REVIEW MATERIAL'):
+            if match('independently review every substantive', prompt):
                 return material_review('Draft')
             return quiz_review([])
         with patch.object(app, 'load_config', return_value=CONFIG), patch.object(app, 'ai_call', fake_ai), \

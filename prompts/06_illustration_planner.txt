@@ -1,0 +1,33 @@
+Create {{MAX_ILLUSTRATIONS}} prompts that is ready to give to image creation model to help for the visual of the learning. 
+
+NUMBERED SECTIONS:
+{{NUMBERED_SECTIONS}}
+
+Heads:
+{{MATERIAL_HEAD}}
+
+
+Output must respect this syntax.
+
+SECTION:
+<number section>
+PROMPT:
+<prompt>
+ALT:
+<briefly what this image about>
+
+SECTION:
+<number section>
+PROMPT:
+<prompt>
+ALT:
+<briefly what this image about>
+
+...
+
+SECTION:
+<number section>
+PROMPT:
+<prompt>
+ALT:
+<briefly what this image about>
